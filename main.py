@@ -1,7 +1,7 @@
 import telebot
 import mysql.connector
 import threading
-import jdatetime 
+import jdatetime
 from datetime import datetime, timedelta
 from telebot.types import (
     ReplyKeyboardMarkup, KeyboardButton,
@@ -325,6 +325,275 @@ def db_get_transaction_by_id(tx_id: int) -> dict:
     return row
 
 
+# ── توابع سوپرادمین ──────────────────────────────────────
+
+def db_get_admin(cid: int) -> dict | None:
+    """ادمین رو با chat_id پیدا می‌کنه."""
+    conn = get_connection()
+    cur = conn.cursor(dictionary=True)
+    cur.execute("SELECT * FROM admins WHERE cid = %s", (cid,))
+    row = cur.fetchone()
+    cur.close(); conn.close()
+    return row
+
+
+def db_get_all_users_summary() -> list:
+    """لیست کاربران با خلاصه مالی برای نمایش در پنل."""
+    conn = get_connection()
+    cur = conn.cursor(dictionary=True)
+    cur.execute("""
+        SELECT u.id, u.cid, u.name, u.username, u.is_banned,
+               COALESCE(uf.current_month_debt, 0) AS current_month_debt,
+               COALESCE(uf.previous_debt, 0)      AS previous_debt
+        FROM users u
+        LEFT JOIN user_finance uf ON uf.user_id = u.id
+        ORDER BY u.name
+    """)
+    rows = cur.fetchall()
+    cur.close(); conn.close()
+    return rows
+
+
+def db_get_user_full_report(user_db_id: int) -> dict:
+    """گزارش کامل یک کاربر: مشخصات + مالی + سفارشات + تراکنش‌ها + اقساط."""
+    conn = get_connection()
+    cur = conn.cursor(dictionary=True)
+
+    cur.execute("SELECT * FROM users WHERE id = %s", (user_db_id,))
+    user = cur.fetchone()
+    if not user:
+        cur.close(); conn.close()
+        return None
+
+    cur.execute("SELECT * FROM user_finance WHERE user_id = %s", (user_db_id,))
+    finance = cur.fetchone()
+
+    cur.execute("""
+        SELECT o.id, o.total_price, o.fabric, o.delivery_date,
+               o.status, o.created_at,
+               COUNT(oi.id) AS item_count
+        FROM orders o
+        LEFT JOIN order_items oi ON oi.order_id = o.id
+        WHERE o.user_id = %s
+        GROUP BY o.id
+        ORDER BY o.created_at DESC
+        LIMIT 10
+    """, (user_db_id,))
+    orders = cur.fetchall()
+
+    cur.execute("""
+        SELECT * FROM transactions
+        WHERE user_id = %s
+        ORDER BY created_at DESC LIMIT 15
+    """, (user_db_id,))
+    transactions = cur.fetchall()
+
+    cur.execute("""
+        SELECT * FROM installments
+        WHERE user_id = %s
+        ORDER BY created_at DESC
+    """, (user_db_id,))
+    installments = cur.fetchall()
+
+    cur.close(); conn.close()
+    return {
+        "user":         user,
+        "finance":      finance,
+        "orders":       orders,
+        "transactions": transactions,
+        "installments": installments,
+    }
+
+
+def db_add_user(cid: int, name: str, username: str, added_by: int) -> bool:
+    """کاربر جدید اضافه می‌کنه. اگه قبلاً بود False برمی‌گردونه."""
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            INSERT INTO users (cid, name, username, added_by)
+            VALUES (%s, %s, %s, %s)
+        """, (cid, name, username, added_by))
+        user_id = cur.lastrowid
+        cur.execute("""
+            INSERT INTO user_finance (user_id, current_month_debt, previous_debt)
+            VALUES (%s, 0, 0)
+        """, (user_id,))
+        conn.commit()
+        return True
+    except mysql.connector.IntegrityError:
+        return False
+    finally:
+        cur.close(); conn.close()
+
+
+def db_unban_user(user_db_id: int):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        UPDATE users SET is_banned = FALSE, ban_reason = NULL
+        WHERE id = %s
+    """, (user_db_id,))
+    conn.commit()
+    cur.close(); conn.close()
+
+
+def db_transfer_debt_to_previous(user_db_id: int, admin_db_id: int) -> int:
+    """
+    بدهی ماه جاری رو به بدهی قبلی منتقل می‌کنه و پنل کاربر رو باز می‌کنه.
+    برمی‌گردونه مبلغ منتقل‌شده.
+    """
+    conn = get_connection()
+    cur = conn.cursor(dictionary=True)
+
+    cur.execute("""
+        SELECT * FROM user_finance WHERE user_id = %s FOR UPDATE
+    """, (user_db_id,))
+    finance = cur.fetchone()
+    if not finance:
+        cur.close(); conn.close()
+        return 0
+
+    amount = int(finance["current_month_debt"])
+    if amount <= 0:
+        cur.close(); conn.close()
+        return 0
+
+    cur.execute("""
+        UPDATE user_finance
+        SET previous_debt      = previous_debt + %s,
+            current_month_debt = 0
+        WHERE user_id = %s
+    """, (amount, user_db_id))
+
+    # آنبن کاربر
+    cur.execute("""
+        UPDATE users SET is_banned = FALSE, ban_reason = NULL
+        WHERE id = %s
+    """, (user_db_id,))
+
+    # ثبت تراکنش
+    cur.execute("""
+        INSERT INTO transactions (user_id, type, amount, description, created_by)
+        VALUES (%s, 'month_transfer', %s, 'انتقال بدهی ماه جاری به بدهی قبلی', %s)
+    """, (user_db_id, amount, admin_db_id))
+
+    conn.commit()
+    cur.close(); conn.close()
+    return amount
+
+
+def db_add_manual_debt(user_db_id: int, amount: int,
+                        description: str, admin_db_id: int):
+    """اضافه کردن بدهی دستی به ماه جاری."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO user_finance (user_id, current_month_debt)
+        VALUES (%s, %s)
+        ON DUPLICATE KEY UPDATE current_month_debt = current_month_debt + %s
+    """, (user_db_id, amount, amount))
+    cur.execute("""
+        INSERT INTO transactions (user_id, type, amount, description, created_by)
+        VALUES (%s, 'debt_added', %s, %s, %s)
+    """, (user_db_id, amount, description, admin_db_id))
+    conn.commit()
+    cur.close(); conn.close()
+
+
+def db_add_model(name: str, price: int, admin_db_id: int) -> int:
+    """مدل جدید + قیمت اولیه. برمی‌گردونه model_id."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("INSERT INTO models (name) VALUES (%s)", (name,))
+    model_id = cur.lastrowid
+    cur.execute("""
+        INSERT INTO model_prices (model_id, price, set_by)
+        VALUES (%s, %s, %s)
+    """, (model_id, price, admin_db_id))
+    conn.commit()
+    cur.close(); conn.close()
+    return model_id
+
+
+def db_toggle_model(model_id: int) -> bool:
+    """فعال/غیرفعال کردن مدل. برمی‌گردونه وضعیت جدید."""
+    conn = get_connection()
+    cur = conn.cursor(dictionary=True)
+    cur.execute("SELECT is_active FROM models WHERE id = %s", (model_id,))
+    row = cur.fetchone()
+    new_status = not row["is_active"]
+    cur.execute("UPDATE models SET is_active = %s WHERE id = %s",
+                (new_status, model_id))
+    conn.commit()
+    cur.close(); conn.close()
+    return new_status
+
+
+def db_set_model_price(model_id: int, price: int, admin_db_id: int):
+    """قیمت جدید برای مدل."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO model_prices (model_id, price, set_by)
+        VALUES (%s, %s, %s)
+    """, (model_id, price, admin_db_id))
+    conn.commit()
+    cur.close(); conn.close()
+
+
+def db_add_installment(user_db_id: int, total_amount: int,
+                        num_installments: int, due_dates: list,
+                        admin_db_id: int) -> int:
+    """قسط‌بندی جدید برای کاربر."""
+    import json
+    per = total_amount // num_installments
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO installments
+            (user_id, total_amount, num_installments, per_installment, due_dates, created_by)
+        VALUES (%s, %s, %s, %s, %s, %s)
+    """, (user_db_id, total_amount, num_installments, per,
+          json.dumps(due_dates), admin_db_id))
+    inst_id = cur.lastrowid
+    conn.commit()
+    cur.close(); conn.close()
+    return inst_id
+
+
+def db_get_all_orders_pending() -> list:
+    """سفارشات در انتظار تایید برای ادمین عادی (بدون قیمت)."""
+    conn = get_connection()
+    cur = conn.cursor(dictionary=True)
+    cur.execute("""
+        SELECT o.id, o.fabric, o.delivery_date, o.status, o.note, o.created_at,
+               u.name AS user_name
+        FROM orders o
+        JOIN users u ON u.id = o.user_id
+        WHERE o.status = 'pending'
+        ORDER BY o.created_at ASC
+    """)
+    rows = cur.fetchall()
+    cur.close(); conn.close()
+    return rows
+
+
+def db_get_order_items_no_price(order_id: int) -> list:
+    """آیتم‌های سفارش بدون قیمت - برای ادمین عادی."""
+    conn = get_connection()
+    cur = conn.cursor(dictionary=True)
+    cur.execute("""
+        SELECT m.name AS model_name, oi.quantity
+        FROM order_items oi
+        JOIN models m ON m.id = oi.model_id
+        WHERE oi.order_id = %s
+    """, (order_id,))
+    rows = cur.fetchall()
+    cur.close(); conn.close()
+    return rows
+
+
 # ════════════════════════════════════════════════════════
 #  STATE MANAGEMENT
 #  user_states[cid] = {"step": "...", "data": {...}}
@@ -344,6 +613,19 @@ STEP_CONFIRM        = "confirm"
 STEP_PAY_ENTER_AMOUNT = "pay_enter_amount"
 STEP_PAY_SEND_RECEIPT = "pay_send_receipt"
 STEP_PAY_CONFIRM      = "pay_confirm"
+
+# سوپرادمین
+STEP_SA_ADD_USER_CID      = "sa_add_user_cid"
+STEP_SA_ADD_USER_NAME     = "sa_add_user_name"
+STEP_SA_ADD_USER_USERNAME = "sa_add_user_username"
+STEP_SA_ADD_MODEL_NAME    = "sa_add_model_name"
+STEP_SA_ADD_MODEL_PRICE   = "sa_add_model_price"
+STEP_SA_SET_PRICE_AMOUNT  = "sa_set_price_amount"
+STEP_SA_ADD_DEBT_AMOUNT   = "sa_add_debt_amount"
+STEP_SA_ADD_DEBT_DESC     = "sa_add_debt_desc"
+STEP_SA_INST_AMOUNT       = "sa_inst_amount"
+STEP_SA_INST_COUNT        = "sa_inst_count"
+STEP_SA_INST_DATES        = "sa_inst_dates"
 
 
 def get_state(cid: int) -> dict:
@@ -463,6 +745,102 @@ def admin_payment_kb(tx_id: int) -> InlineKeyboardMarkup:
     return kb
 
 
+# ── کیبوردهای ادمین عادی ─────────────────────────────────
+
+def admin_menu_kb() -> ReplyKeyboardMarkup:
+    kb = ReplyKeyboardMarkup(resize_keyboard=True, row_width=1)
+    kb.add(KeyboardButton("📋 سفارشات در انتظار"))
+    return kb
+
+
+def admin_order_list_kb(orders: list) -> InlineKeyboardMarkup:
+    """لیست سفارشات pending برای ادمین عادی."""
+    kb = InlineKeyboardMarkup(row_width=1)
+    for o in orders:
+        label = f"#{o['id']} — {o['user_name']} — {o['created_at'].strftime('%m/%d')}"
+        kb.add(InlineKeyboardButton(label, callback_data=f"adm_order_{o['id']}"))
+    return kb
+
+
+def admin_order_status_kb(order_id: int) -> InlineKeyboardMarkup:
+    """تغییر وضعیت سفارش توسط ادمین عادی."""
+    kb = InlineKeyboardMarkup(row_width=2)
+    statuses = [
+        ("✅ تایید",          "approved"),
+        ("🔧 در حال تولید",   "producing"),
+        ("📦 آماده تحویل",    "ready"),
+        ("🚚 تحویل داده شد",  "delivered"),
+        ("❌ رد سفارش",       "rejected"),
+    ]
+    for label, status in statuses:
+        kb.add(InlineKeyboardButton(label, callback_data=f"adm_setstatus_{order_id}_{status}"))
+    return kb
+
+
+# ── کیبوردهای سوپرادمین ──────────────────────────────────
+
+def superadmin_menu_kb() -> ReplyKeyboardMarkup:
+    kb = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    kb.add(
+        KeyboardButton("👥 کاربران"),
+        KeyboardButton("📦 مدل‌ها"),
+    )
+    kb.add(
+        KeyboardButton("📋 سفارشات در انتظار"),
+        KeyboardButton("📊 گزارش مالی"),
+    )
+    return kb
+
+
+def sa_users_list_kb(users: list) -> InlineKeyboardMarkup:
+    """لیست کاربران با خلاصه بدهی."""
+    kb = InlineKeyboardMarkup(row_width=1)
+    for u in users:
+        debt = int(u["current_month_debt"]) + int(u["previous_debt"])
+        banned = "🚫" if u["is_banned"] else "✅"
+        label = f"{banned} {u['name']}  |  بدهی: {debt:,}"
+        kb.add(InlineKeyboardButton(label, callback_data=f"sa_user_{u['id']}"))
+    kb.add(InlineKeyboardButton("➕ افزودن کاربر جدید", callback_data="sa_add_user"))
+    return kb
+
+
+def sa_user_actions_kb(user_db_id: int, is_banned: bool) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup(row_width=2)
+    ban_label = "✅ رفع مسدودی" if is_banned else "🚫 مسدود کردن"
+    ban_cb    = f"sa_unban_{user_db_id}" if is_banned else f"sa_ban_{user_db_id}"
+    kb.add(
+        InlineKeyboardButton(ban_label,                  callback_data=ban_cb),
+        InlineKeyboardButton("🔄 انتقال بدهی به قبلی",  callback_data=f"sa_transfer_{user_db_id}"),
+    )
+    kb.add(
+        InlineKeyboardButton("➕ افزودن بدهی دستی",     callback_data=f"sa_adddebt_{user_db_id}"),
+        InlineKeyboardButton("📋 قسط‌بندی",             callback_data=f"sa_inst_{user_db_id}"),
+    )
+    kb.add(InlineKeyboardButton("🔙 بازگشت به لیست",   callback_data="sa_users_list"))
+    return kb
+
+
+def sa_models_kb(models: list) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup(row_width=1)
+    for m in models:
+        status = "✅" if m["is_active"] else "❌"
+        label  = f"{status} {m['name']}  |  {m['price']:,} تومان"
+        kb.add(InlineKeyboardButton(label, callback_data=f"sa_model_{m['id']}"))
+    kb.add(InlineKeyboardButton("➕ افزودن مدل جدید", callback_data="sa_add_model"))
+    return kb
+
+
+def sa_model_actions_kb(model_id: int, is_active: bool) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup(row_width=2)
+    toggle_label = "❌ غیرفعال کن" if is_active else "✅ فعال کن"
+    kb.add(
+        InlineKeyboardButton(toggle_label,          callback_data=f"sa_modeltoggle_{model_id}"),
+        InlineKeyboardButton("💲 تغییر قیمت",       callback_data=f"sa_modelprice_{model_id}"),
+    )
+    kb.add(InlineKeyboardButton("🔙 بازگشت به مدل‌ها", callback_data="sa_models_list"))
+    return kb
+
+
 # ════════════════════════════════════════════════════════
 #  HELPERS
 # ════════════════════════════════════════════════════════
@@ -524,13 +902,32 @@ bot.set_update_listener(info_listener)
 @bot.message_handler(commands=["start"])
 def cmd_start(message: Message):
     cid = message.chat.id
-    user = db_get_user(cid)
+    clear_state(cid)
 
+    # چک سوپرادمین / ادمین
+    admin = db_get_admin(cid)
+    if admin:
+        role = admin["role"]
+        if role == "superadmin":
+            bot.send_message(
+                cid,
+                f"سلام <b>{admin['name']}</b> 👋\n🔑 پنل سوپرادمین",
+                reply_markup=superadmin_menu_kb()
+            )
+        else:
+            bot.send_message(
+                cid,
+                f"سلام <b>{admin['name']}</b> 👋\n🛠 پنل ادمین",
+                reply_markup=admin_menu_kb()
+            )
+        return
+
+    # چک کاربر عادی
+    user = db_get_user(cid)
     if not user:
         bot.send_message(cid, "⛔️ شما دسترسی به این ربات ندارید.\nبا ادمین تماس بگیرید.")
         return
 
-    clear_state(cid)
     bot.send_message(
         cid,
         f"سلام <b>{message.from_user.first_name}</b> 👋\nبه ربات خوش اومدی.",
@@ -1415,6 +1812,792 @@ def _admin_receive_pay_reject_reason(message: Message, tx_id: int):
 
 
 # ════════════════════════════════════════════════════════
+#  HANDLERS - ادمین عادی
+# ════════════════════════════════════════════════════════
+
+def _is_admin(cid: int) -> bool:
+    return db_get_admin(cid) is not None
+
+def _is_superadmin(cid: int) -> bool:
+    a = db_get_admin(cid)
+    return a is not None and a["role"] == "superadmin"
+
+
+@bot.message_handler(func=lambda m: m.text == "📋 سفارشات در انتظار")
+def btn_pending_orders(message: Message):
+    cid = message.chat.id
+    if not _is_admin(cid):
+        bot.send_message(cid, "⛔️ دسترسی ندارید."); return
+
+    orders = db_get_all_orders_pending()
+    if not orders:
+        bot.send_message(cid, "✅ هیچ سفارش در انتظاری وجود ندارد.")
+        return
+
+    bot.send_message(
+        cid,
+        f"📋 <b>{len(orders)} سفارش در انتظار تایید:</b>",
+        reply_markup=admin_order_list_kb(orders)
+    )
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("adm_order_"))
+def cb_adm_order_detail(call: CallbackQuery):
+    cid = call.message.chat.id
+    if not _is_admin(cid):
+        bot.answer_callback_query(call.id, "⛔️ دسترسی ندارید."); return
+
+    order_id = int(call.data.split("_")[2])
+    is_super  = _is_superadmin(cid)
+
+    if is_super:
+        order = db_get_order_with_items(order_id)
+    else:
+        order = db_get_order_with_items(order_id)
+
+    if not order:
+        bot.answer_callback_query(call.id, "❌ سفارش پیدا نشد."); return
+
+    bot.answer_callback_query(call.id)
+
+    STATUS_FA = {
+        "pending":   "⏳ در انتظار",
+        "approved":  "✅ تایید شده",
+        "producing": "🔧 در حال تولید",
+        "ready":     "📦 آماده تحویل",
+        "delivered": "🚚 تحویل داده شد",
+        "rejected":  "❌ رد شده",
+    }
+
+    if is_super:
+        # سوپرادمین با قیمت می‌بینه
+        items_text = "\n".join(
+            f"  • {i['model_name']}  ×{i['quantity']}  =  {int(i['line_total']):,} تومان"
+            for i in order["items"]
+        )
+        text = (
+            f"📦 <b>سفارش #{order_id}</b>\n"
+            f"وضعیت: {STATUS_FA.get(order['status'], order['status'])}\n"
+            f"تاریخ ثبت: {order['created_at'].strftime('%Y/%m/%d %H:%M')}\n"
+            f"تاریخ تحویل: {order['delivery_date']}\n"
+            f"پارچه: {order['fabric']}\n\n"
+            f"<b>آیتم‌ها:</b>\n{items_text}\n\n"
+            f"💵 جمع کل: <b>{int(order['total_price']):,}</b> تومان"
+        )
+    else:
+        # ادمین عادی بدون قیمت
+        items = db_get_order_items_no_price(order_id)
+        items_text = "\n".join(
+            f"  • {i['model_name']}  ×{i['quantity']}"
+            for i in items
+        )
+        text = (
+            f"📦 <b>سفارش #{order_id}</b>\n"
+            f"وضعیت: {STATUS_FA.get(order['status'], order['status'])}\n"
+            f"تاریخ ثبت: {order['created_at'].strftime('%Y/%m/%d %H:%M')}\n"
+            f"تاریخ تحویل: {order['delivery_date']}\n"
+            f"پارچه: {order['fabric']}\n\n"
+            f"<b>آیتم‌ها:</b>\n{items_text}"
+        )
+        if order.get("note"):
+            text += f"\n\n📝 یادداشت: {order['note']}"
+
+    bot.send_message(cid, text, reply_markup=admin_order_status_kb(order_id))
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("adm_setstatus_"))
+def cb_adm_set_status(call: CallbackQuery):
+    cid = call.message.chat.id
+    if not _is_admin(cid):
+        bot.answer_callback_query(call.id, "⛔️ دسترسی ندارید."); return
+
+    parts    = call.data.split("_")
+    order_id = int(parts[2])
+    status   = parts[3]
+
+    if status == "rejected":
+        bot.answer_callback_query(call.id)
+        msg = bot.send_message(cid, f"❌ دلیل رد سفارش #{order_id} رو بنویس:")
+        bot.register_next_step_handler(msg, _admin_receive_reject_reason, order_id)
+        return
+
+    db_update_order_status(order_id, status)
+    bot.answer_callback_query(call.id, "✅ وضعیت بروز شد.")
+    bot.edit_message_reply_markup(cid, call.message.message_id, reply_markup=None)
+
+    STATUS_FA = {
+        "approved":  "✅ تایید شد",
+        "producing": "🔧 وارد تولید شد",
+        "ready":     "📦 آماده تحویل شد",
+        "delivered": "🚚 تحویل داده شد",
+    }
+    bot.send_message(cid, f"سفارش #{order_id} → {STATUS_FA.get(status, status)}")
+
+    # اطلاع به کاربر
+    order = db_get_order_with_items(order_id)
+    if order:
+        user = db_get_user_by_db_id(order["user_id"])
+        if user:
+            user_msg = {
+                "approved":  f"🎉 سفارش #{order_id} شما تایید شد و وارد تولید می‌شه.",
+                "producing": f"🔧 سفارش #{order_id} شما در حال تولید است.",
+                "ready":     f"📦 سفارش #{order_id} شما آماده تحویل است.",
+                "delivered": f"✅ سفارش #{order_id} شما تحویل داده شد.",
+            }
+            if status in user_msg:
+                try:
+                    bot.send_message(user["cid"], f"<b>{user_msg[status]}</b>")
+                except Exception as e:
+                    print(f"[WARN] اطلاع‌رسانی به کاربر ناموفق: {e}")
+
+
+# ════════════════════════════════════════════════════════
+#  HANDLERS - سوپرادمین
+# ════════════════════════════════════════════════════════
+
+# ── منوی کاربران ─────────────────────────────────────────
+
+@bot.message_handler(func=lambda m: m.text == "👥 کاربران")
+def btn_sa_users(message: Message):
+    cid = message.chat.id
+    if not _is_superadmin(cid):
+        bot.send_message(cid, "⛔️ دسترسی ندارید."); return
+
+    users = db_get_all_users_summary()
+    if not users:
+        bot.send_message(
+            cid, "هنوز کاربری ثبت نشده.",
+            reply_markup=sa_users_list_kb([])
+        )
+        return
+
+    total_debt = sum(int(u["current_month_debt"]) + int(u["previous_debt"]) for u in users)
+    banned_cnt = sum(1 for u in users if u["is_banned"])
+
+    bot.send_message(
+        cid,
+        f"👥 <b>کاربران ({len(users)} نفر)</b>\n"
+        f"🔴 مسدود: {banned_cnt}  |  💰 کل بدهی: {total_debt:,} تومان\n\n"
+        f"یک کاربر رو انتخاب کن:",
+        reply_markup=sa_users_list_kb(users)
+    )
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "sa_users_list")
+def cb_sa_users_list(call: CallbackQuery):
+    cid = call.message.chat.id
+    if not _is_superadmin(cid):
+        bot.answer_callback_query(call.id, "⛔️"); return
+    bot.answer_callback_query(call.id)
+    users = db_get_all_users_summary()
+    bot.send_message(cid, "👥 لیست کاربران:", reply_markup=sa_users_list_kb(users))
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("sa_user_"))
+def cb_sa_user_detail(call: CallbackQuery):
+    cid = call.message.chat.id
+    if not _is_superadmin(cid):
+        bot.answer_callback_query(call.id, "⛔️"); return
+
+    user_db_id = int(call.data.split("_")[2])
+    bot.answer_callback_query(call.id)
+    report = db_get_user_full_report(user_db_id)
+    if not report:
+        bot.send_message(cid, "❌ کاربر پیدا نشد."); return
+
+    u  = report["user"]
+    f  = report["finance"] or {}
+    cmd  = int(f.get("current_month_debt", 0))
+    prev = int(f.get("previous_debt", 0))
+
+    # ── خلاصه مشخصات ──
+    text = (
+        f"👤 <b>{u['name']}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🆔 CID: <code>{u['cid']}</code>\n"
+        f"👤 یوزرنیم: @{u['username'] or '—'}\n"
+        f"📅 عضویت: {u['created_at'].strftime('%Y/%m/%d') if u.get('created_at') else '—'}\n"
+        f"وضعیت: {'🚫 مسدود' if u['is_banned'] else '✅ فعال'}\n"
+    )
+    if u["is_banned"] and u.get("ban_reason"):
+        text += f"دلیل مسدودی: {u['ban_reason']}\n"
+
+    # ── مالی ──
+    text += (
+        f"\n💰 <b>وضعیت مالی:</b>\n"
+        f"  📅 بدهی ماه جاری: <b>{cmd:,}</b> تومان\n"
+        f"  💳 بدهی قبلی:     <b>{prev:,}</b> تومان\n"
+        f"  📊 جمع کل:        <b>{cmd+prev:,}</b> تومان\n"
+    )
+
+    # ── اقساط ──
+    if report["installments"]:
+        text += f"\n📋 <b>اقساط ({len(report['installments'])} مورد):</b>\n"
+        for inst in report["installments"]:
+            remain = int(inst["total_amount"]) - int(inst["paid_amount"])
+            text += f"  • کل: {int(inst['total_amount']):,}  |  باقی: {remain:,}\n"
+
+    # ── آخرین سفارشات ──
+    if report["orders"]:
+        STATUS_FA = {
+            "pending":"⏳","approved":"✅","producing":"🔧",
+            "ready":"📦","delivered":"🚚","rejected":"❌"
+        }
+        text += f"\n📦 <b>آخرین سفارشات:</b>\n"
+        for o in report["orders"][:5]:
+            st = STATUS_FA.get(o["status"], "?")
+            text += (
+                f"  {st} #{o['id']}  |  {int(o['total_price']):,} تومان"
+                f"  |  {o['created_at'].strftime('%m/%d')}\n"
+            )
+
+    # ── آخرین تراکنش‌ها ──
+    if report["transactions"]:
+        TYPE_FA = {
+            "order":"🛒","payment":"💵","debt_added":"➕",
+            "installment":"📋","month_transfer":"🔄"
+        }
+        text += f"\n💳 <b>آخرین تراکنش‌ها:</b>\n"
+        for tx in report["transactions"][:5]:
+            tp = TYPE_FA.get(tx["type"], "•")
+            st = ""
+            if tx.get("status") == "pending":  st = " ⏳"
+            if tx.get("status") == "rejected": st = " ❌"
+            text += (
+                f"  {tp}{st} {int(tx['amount']):,} تومان"
+                f"  |  {tx['created_at'].strftime('%m/%d')}\n"
+            )
+
+    bot.send_message(cid, text, reply_markup=sa_user_actions_kb(user_db_id, u["is_banned"]))
+
+
+# ── افزودن کاربر ─────────────────────────────────────────
+
+@bot.callback_query_handler(func=lambda c: c.data == "sa_add_user")
+def cb_sa_add_user(call: CallbackQuery):
+    cid = call.message.chat.id
+    if not _is_superadmin(cid):
+        bot.answer_callback_query(call.id, "⛔️"); return
+    bot.answer_callback_query(call.id)
+    set_state(cid, STEP_SA_ADD_USER_CID)
+    msg = bot.send_message(cid, "➕ <b>افزودن کاربر جدید</b>\n\nChat ID کاربر رو وارد کن:")
+    bot.register_next_step_handler(msg, _sa_add_user_cid)
+
+
+def _sa_add_user_cid(message: Message):
+    cid = message.chat.id
+    if get_state(cid).get("step") != STEP_SA_ADD_USER_CID: return
+    try:
+        new_cid = int(message.text.strip())
+    except ValueError:
+        msg = bot.send_message(cid, "❌ Chat ID باید عدد باشه:")
+        bot.register_next_step_handler(msg, _sa_add_user_cid); return
+    set_state(cid, STEP_SA_ADD_USER_NAME, new_user_cid=new_cid)
+    msg = bot.send_message(cid, "نام کاربر رو وارد کن:")
+    bot.register_next_step_handler(msg, _sa_add_user_name)
+
+
+def _sa_add_user_name(message: Message):
+    cid = message.chat.id
+    if get_state(cid).get("step") != STEP_SA_ADD_USER_NAME: return
+    name = message.text.strip()
+    set_state(cid, STEP_SA_ADD_USER_USERNAME, new_user_name=name)
+    msg = bot.send_message(cid, "یوزرنیم رو وارد کن (بدون @ — یا عدد ۰ برای بدون یوزرنیم):")
+    bot.register_next_step_handler(msg, _sa_add_user_username)
+
+
+def _sa_add_user_username(message: Message):
+    cid = message.chat.id
+    if get_state(cid).get("step") != STEP_SA_ADD_USER_USERNAME: return
+    username = message.text.strip()
+    if username == "0":
+        username = None
+    d = get_state(cid)["data"]
+    admin = db_get_admin(cid)
+    success = db_add_user(d["new_user_cid"], d["new_user_name"], username, admin["id"])
+    clear_state(cid)
+    if success:
+        bot.send_message(
+            cid,
+            f"✅ کاربر <b>{d['new_user_name']}</b> با موفقیت اضافه شد.\n"
+            f"CID: <code>{d['new_user_cid']}</code>"
+        )
+        # اطلاع به کاربر جدید
+        try:
+            bot.send_message(
+                d["new_user_cid"],
+                "🎉 حساب شما در ربات فعال شد!\n"
+                "برای شروع /start را بزنید."
+            )
+        except Exception:
+            pass
+    else:
+        bot.send_message(cid, "⚠️ این کاربر قبلاً ثبت شده.")
+
+
+# ── بن / آنبن ────────────────────────────────────────────
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("sa_ban_"))
+def cb_sa_ban(call: CallbackQuery):
+    cid = call.message.chat.id
+    if not _is_superadmin(cid):
+        bot.answer_callback_query(call.id, "⛔️"); return
+    user_db_id = int(call.data.split("_")[2])
+    bot.answer_callback_query(call.id)
+    db_ban_user(user_db_id, "مسدود شده توسط سوپرادمین")
+    bot.send_message(cid, "🚫 کاربر مسدود شد.")
+    user = db_get_user_by_db_id(user_db_id)
+    if user:
+        try:
+            bot.send_message(user["cid"], "🚫 حساب شما توسط ادمین مسدود شد.")
+        except Exception:
+            pass
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("sa_unban_"))
+def cb_sa_unban(call: CallbackQuery):
+    cid = call.message.chat.id
+    if not _is_superadmin(cid):
+        bot.answer_callback_query(call.id, "⛔️"); return
+    user_db_id = int(call.data.split("_")[2])
+    bot.answer_callback_query(call.id)
+    db_unban_user(user_db_id)
+    bot.send_message(cid, "✅ مسدودی کاربر رفع شد.")
+    user = db_get_user_by_db_id(user_db_id)
+    if user:
+        try:
+            bot.send_message(user["cid"], "✅ مسدودی حساب شما رفع شد. می‌تونید سفارش بدید.")
+        except Exception:
+            pass
+
+
+# ── انتقال بدهی ماه جاری به قبلی ─────────────────────────
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("sa_transfer_"))
+def cb_sa_transfer(call: CallbackQuery):
+    cid = call.message.chat.id
+    if not _is_superadmin(cid):
+        bot.answer_callback_query(call.id, "⛔️"); return
+    user_db_id  = int(call.data.split("_")[2])
+    admin       = db_get_admin(cid)
+    bot.answer_callback_query(call.id, "⏳ در حال انتقال...")
+    amount = db_transfer_debt_to_previous(user_db_id, admin["id"])
+    if amount == 0:
+        bot.send_message(cid, "⚠️ این کاربر بدهی ماه جاری ندارد.")
+        return
+    bot.send_message(
+        cid,
+        f"✅ <b>{amount:,} تومان</b> از بدهی ماه جاری به بدهی قبلی منتقل شد.\n"
+        f"پنل کاربر هم باز شد."
+    )
+    user = db_get_user_by_db_id(user_db_id)
+    if user:
+        try:
+            bot.send_message(
+                user["cid"],
+                f"🔔 بدهی ماه جاری شما (<b>{amount:,}</b> تومان) به بدهی قبلی منتقل شد.\n"
+                f"پنل شما باز است و می‌توانید سفارش ثبت کنید."
+            )
+        except Exception:
+            pass
+
+
+# ── افزودن بدهی دستی ─────────────────────────────────────
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("sa_adddebt_"))
+def cb_sa_add_debt(call: CallbackQuery):
+    cid = call.message.chat.id
+    if not _is_superadmin(cid):
+        return
+    bot.answer_callback_query(call.id)
+    user_db_id = int(call.data.split("_")[2])
+    set_state(cid, STEP_SA_ADD_DEBT_AMOUNT, target_user_id=user_db_id)
+    msg = bot.send_message(cid, "➕ <b>افزودن بدهی دستی</b>\n\nمبلغ بدهی رو وارد کن (تومان):")
+    bot.register_next_step_handler(msg, _sa_debt_amount)
+
+
+def _sa_debt_amount(message: Message):
+    cid = message.chat.id
+    if get_state(cid).get("step") != STEP_SA_ADD_DEBT_AMOUNT: return
+    try:
+        amount = int(message.text.strip().replace(",", "").replace("،", ""))
+        if amount <= 0: raise ValueError
+    except ValueError:
+        msg = bot.send_message(cid, "❌ عدد مثبت وارد کن:")
+        bot.register_next_step_handler(msg, _sa_debt_amount); return
+    set_state(cid, STEP_SA_ADD_DEBT_DESC, debt_amount=amount)
+    msg = bot.send_message(cid, "توضیح بدهی رو بنویس:")
+    bot.register_next_step_handler(msg, _sa_debt_desc)
+
+
+def _sa_debt_desc(message: Message):
+    cid = message.chat.id
+    if get_state(cid).get("step") != STEP_SA_ADD_DEBT_DESC: return
+    desc   = message.text.strip()
+    d      = get_state(cid)["data"]
+    admin  = db_get_admin(cid)
+    db_add_manual_debt(d["target_user_id"], d["debt_amount"], desc, admin["id"])
+    clear_state(cid)
+    bot.send_message(
+        cid,
+        f"✅ <b>{d['debt_amount']:,} تومان</b> بدهی اضافه شد.\nتوضیح: {desc}"
+    )
+    user = db_get_user_by_db_id(d["target_user_id"])
+    if user:
+        try:
+            bot.send_message(
+                user["cid"],
+                f"🔔 <b>{d['debt_amount']:,} تومان</b> به بدهی ماه جاری شما اضافه شد.\n"
+                f"توضیح: {desc}"
+            )
+        except Exception:
+            pass
+
+
+# ── قسط‌بندی ────────────────────────────────────────────
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("sa_inst_"))
+def cb_sa_installment(call: CallbackQuery):
+    cid = call.message.chat.id
+    if not _is_superadmin(cid):
+        bot.answer_callback_query(call.id, "⛔️"); return
+    user_db_id = int(call.data.split("_")[2])
+    bot.answer_callback_query(call.id)
+    set_state(cid, STEP_SA_INST_AMOUNT, target_user_id=user_db_id)
+    msg = bot.send_message(
+        cid,
+        "📋 <b>قسط‌بندی جدید</b>\n\n"
+        "کل مبلغ قسط‌بندی رو وارد کن (تومان):"
+    )
+    bot.register_next_step_handler(msg, _sa_inst_amount)
+
+
+def _sa_inst_amount(message: Message):
+    cid = message.chat.id
+    if get_state(cid).get("step") != STEP_SA_INST_AMOUNT: return
+    try:
+        amount = int(message.text.strip().replace(",", "").replace("،", ""))
+        if amount <= 0: raise ValueError
+    except ValueError:
+        msg = bot.send_message(cid, "❌ عدد مثبت وارد کن:")
+        bot.register_next_step_handler(msg, _sa_inst_amount); return
+    set_state(cid, STEP_SA_INST_COUNT, inst_total=amount)
+    msg = bot.send_message(cid, "تعداد اقساط رو وارد کن:")
+    bot.register_next_step_handler(msg, _sa_inst_count)
+
+
+def _sa_inst_count(message: Message):
+    cid = message.chat.id
+    if get_state(cid).get("step") != STEP_SA_INST_COUNT: return
+    try:
+        count = int(message.text.strip())
+        if count <= 0: raise ValueError
+    except ValueError:
+        msg = bot.send_message(cid, "❌ عدد مثبت وارد کن:")
+        bot.register_next_step_handler(msg, _sa_inst_count); return
+
+    d   = get_state(cid)["data"]
+    per = d["inst_total"] // count
+    set_state(cid, STEP_SA_INST_DATES, inst_count=count, per_inst=per)
+
+    msg = bot.send_message(
+        cid,
+        f"هر قسط: <b>{per:,}</b> تومان\n\n"
+        f"تاریخ سررسید {count} قسط رو خط به خط وارد کن (YYYY-MM-DD):\n"
+        f"مثال:\n2025-02-01\n2025-03-01"
+    )
+    bot.register_next_step_handler(msg, _sa_inst_dates)
+
+
+def _sa_inst_dates(message: Message):
+    cid = message.chat.id
+    if get_state(cid).get("step") != STEP_SA_INST_DATES: return
+    lines = [l.strip() for l in message.text.strip().splitlines() if l.strip()]
+    d     = get_state(cid)["data"]
+    count = d["inst_count"]
+
+    if len(lines) != count:
+        msg = bot.send_message(
+            cid,
+            f"❌ باید دقیقاً {count} تاریخ وارد کنی (الان {len(lines)} تا).\nدوباره:"
+        )
+        bot.register_next_step_handler(msg, _sa_inst_dates); return
+
+    for line in lines:
+        try:
+            datetime.strptime(line, "%Y-%m-%d")
+        except ValueError:
+            msg = bot.send_message(cid, f"❌ فرمت اشتباه: {line}\nدوباره:")
+            bot.register_next_step_handler(msg, _sa_inst_dates); return
+
+    admin = db_get_admin(cid)
+    inst_id = db_add_installment(
+        d["target_user_id"], d["inst_total"],
+        count, lines, admin["id"]
+    )
+    clear_state(cid)
+    bot.send_message(
+        cid,
+        f"✅ قسط‌بندی #{inst_id} ثبت شد.\n"
+        f"کل: {d['inst_total']:,}  |  {count} قسط  |  هر قسط: {d['per_inst']:,} تومان"
+    )
+    user = db_get_user_by_db_id(d["target_user_id"])
+    if user:
+        dates_text = "\n".join(f"  • {dt}" for dt in lines)
+        try:
+            bot.send_message(
+                user["cid"],
+                f"📋 <b>قسط‌بندی جدید برای شما تنظیم شد.</b>\n"
+                f"کل مبلغ: {d['inst_total']:,} تومان\n"
+                f"تعداد اقساط: {count}\n"
+                f"هر قسط: {d['per_inst']:,} تومان\n\n"
+                f"تاریخ‌های سررسید:\n{dates_text}"
+            )
+        except Exception:
+            pass
+
+
+# ── مدیریت مدل‌ها ────────────────────────────────────────
+
+@bot.message_handler(func=lambda m: m.text == "📦 مدل‌ها")
+def btn_sa_models(message: Message):
+    cid = message.chat.id
+    if not _is_superadmin(cid):
+        bot.send_message(cid, "⛔️ دسترسی ندارید."); return
+    models = db_get_active_models()
+    # همه مدل‌ها رو می‌خوایم نه فقط active
+    conn = get_connection()
+    cur  = conn.cursor(dictionary=True)
+    cur.execute("""
+        SELECT m.id, m.name, m.is_active,
+               COALESCE((
+                   SELECT price FROM model_prices
+                   WHERE model_id = m.id ORDER BY set_at DESC LIMIT 1
+               ), 0) AS price
+        FROM models m ORDER BY m.name
+    """)
+    all_models = cur.fetchall()
+    cur.close(); conn.close()
+
+    if not all_models:
+        bot.send_message(cid, "هنوز مدلی ثبت نشده.", reply_markup=sa_models_kb([]))
+        return
+
+    bot.send_message(
+        cid,
+        f"📦 <b>مدل‌ها ({len(all_models)} مورد)</b>\nیک مدل انتخاب کن:",
+        reply_markup=sa_models_kb(all_models)
+    )
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "sa_models_list")
+def cb_sa_models_list(call: CallbackQuery):
+    cid = call.message.chat.id
+    if not _is_superadmin(cid):
+        bot.answer_callback_query(call.id, "⛔️"); return
+    bot.answer_callback_query(call.id)
+    conn = get_connection()
+    cur  = conn.cursor(dictionary=True)
+    cur.execute("""
+        SELECT m.id, m.name, m.is_active,
+               COALESCE((SELECT price FROM model_prices
+                         WHERE model_id=m.id ORDER BY set_at DESC LIMIT 1), 0) AS price
+        FROM models m ORDER BY m.name
+    """)
+    all_models = cur.fetchall()
+    cur.close(); conn.close()
+    bot.send_message(cid, "📦 لیست مدل‌ها:", reply_markup=sa_models_kb(all_models))
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("sa_model_") and not c.data.startswith("sa_modelt") and not c.data.startswith("sa_modelp"))
+def cb_sa_model_detail(call: CallbackQuery):
+    cid = call.message.chat.id
+    if not _is_superadmin(cid):
+        bot.answer_callback_query(call.id, "⛔️"); return
+    model_id = int(call.data.split("_")[2])
+    bot.answer_callback_query(call.id)
+    model = db_get_model_by_id(model_id)
+    if not model:
+        bot.send_message(cid, "❌ مدل پیدا نشد."); return
+
+    conn = get_connection()
+    cur  = conn.cursor(dictionary=True)
+    cur.execute("""
+        SELECT mp.price, mp.set_at, a.name AS admin_name
+        FROM model_prices mp
+        LEFT JOIN admins a ON a.id = mp.set_by
+        WHERE mp.model_id = %s ORDER BY mp.set_at DESC LIMIT 5
+    """, (model_id,))
+    price_history = cur.fetchall()
+    cur.execute("SELECT is_active FROM models WHERE id=%s", (model_id,))
+    m_row = cur.fetchone()
+    cur.close(); conn.close()
+
+    hist_text = "\n".join(
+        f"  • {int(p['price']):,}  |  {p['set_at'].strftime('%Y/%m/%d')}"
+        f"  |  {p['admin_name'] or '—'}"
+        for p in price_history
+    )
+    text = (
+        f"📦 <b>{model['name']}</b>\n"
+        f"وضعیت: {'✅ فعال' if m_row['is_active'] else '❌ غیرفعال'}\n"
+        f"قیمت فعلی: <b>{int(model['price']):,}</b> تومان\n\n"
+        f"📜 تاریخچه قیمت:\n{hist_text or '  —'}"
+    )
+    bot.send_message(cid, text, reply_markup=sa_model_actions_kb(model_id, m_row["is_active"]))
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("sa_modeltoggle_"))
+def cb_sa_model_toggle(call: CallbackQuery):
+    cid = call.message.chat.id
+    if not _is_superadmin(cid):
+        bot.answer_callback_query(call.id, "⛔️"); return
+    model_id   = int(call.data.split("_")[2])
+    new_status = db_toggle_model(model_id)
+    status_fa  = "✅ فعال" if new_status else "❌ غیرفعال"
+    bot.answer_callback_query(call.id, f"وضعیت مدل: {status_fa}")
+    bot.send_message(cid, f"مدل #{model_id} → {status_fa}")
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("sa_modelprice_"))
+def cb_sa_model_price(call: CallbackQuery):
+    cid = call.message.chat.id
+    if not _is_superadmin(cid):
+        bot.answer_callback_query(call.id, "⛔️"); return
+    model_id = int(call.data.split("_")[2])
+    bot.answer_callback_query(call.id)
+    set_state(cid, STEP_SA_SET_PRICE_AMOUNT, price_model_id=model_id)
+    model = db_get_model_by_id(model_id)
+    msg = bot.send_message(
+        cid,
+        f"💲 تغییر قیمت <b>{model['name']}</b>\n"
+        f"قیمت فعلی: {int(model['price']):,} تومان\n\n"
+        f"قیمت جدید رو وارد کن (تومان):"
+    )
+    bot.register_next_step_handler(msg, _sa_set_price)
+
+
+def _sa_set_price(message: Message):
+    cid = message.chat.id
+    if get_state(cid).get("step") != STEP_SA_SET_PRICE_AMOUNT: return
+    try:
+        price = int(message.text.strip().replace(",", "").replace("،", ""))
+        if price <= 0: raise ValueError
+    except ValueError:
+        msg = bot.send_message(cid, "❌ عدد مثبت وارد کن:")
+        bot.register_next_step_handler(msg, _sa_set_price); return
+
+    d        = get_state(cid)["data"]
+    admin    = db_get_admin(cid)
+    model    = db_get_model_by_id(d["price_model_id"])
+    db_set_model_price(d["price_model_id"], price, admin["id"])
+    clear_state(cid)
+    bot.send_message(
+        cid,
+        f"✅ قیمت <b>{model['name']}</b> به <b>{price:,}</b> تومان بروز شد."
+    )
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "sa_add_model")
+def cb_sa_add_model(call: CallbackQuery):
+    cid = call.message.chat.id
+    if not _is_superadmin(cid):
+        bot.answer_callback_query(call.id, "⛔️"); return
+    bot.answer_callback_query(call.id)
+    set_state(cid, STEP_SA_ADD_MODEL_NAME)
+    msg = bot.send_message(cid, "➕ <b>افزودن مدل جدید</b>\n\nنام مدل رو وارد کن:")
+    bot.register_next_step_handler(msg, _sa_add_model_name)
+
+
+def _sa_add_model_name(message: Message):
+    cid = message.chat.id
+    if get_state(cid).get("step") != STEP_SA_ADD_MODEL_NAME: return
+    name = message.text.strip()
+    set_state(cid, STEP_SA_ADD_MODEL_PRICE, new_model_name=name)
+    msg = bot.send_message(cid, f"قیمت اولیه <b>{name}</b> رو وارد کن (تومان):")
+    bot.register_next_step_handler(msg, _sa_add_model_price)
+
+
+def _sa_add_model_price(message: Message):
+    cid = message.chat.id
+    if get_state(cid).get("step") != STEP_SA_ADD_MODEL_PRICE: return
+    try:
+        price = int(message.text.strip().replace(",", "").replace("،", ""))
+        if price <= 0: raise ValueError
+    except ValueError:
+        msg = bot.send_message(cid, "❌ عدد مثبت وارد کن:")
+        bot.register_next_step_handler(msg, _sa_add_model_price); return
+
+    d       = get_state(cid)["data"]
+    admin   = db_get_admin(cid)
+    model_id = db_add_model(d["new_model_name"], price, admin["id"])
+    clear_state(cid)
+    bot.send_message(
+        cid,
+        f"✅ مدل <b>{d['new_model_name']}</b> با قیمت <b>{price:,}</b> تومان اضافه شد.\n"
+        f"شناسه مدل: #{model_id}"
+    )
+
+
+# ── گزارش مالی کلی ───────────────────────────────────────
+
+@bot.message_handler(func=lambda m: m.text == "📊 گزارش مالی")
+def btn_sa_finance_report(message: Message):
+    cid = message.chat.id
+    if not _is_superadmin(cid):
+        bot.send_message(cid, "⛔️ دسترسی ندارید."); return
+
+    conn = get_connection()
+    cur  = conn.cursor(dictionary=True)
+
+    cur.execute("""
+        SELECT
+            SUM(current_month_debt) AS total_cmd,
+            SUM(previous_debt)      AS total_prev
+        FROM user_finance
+    """)
+    fin = cur.fetchone()
+
+    cur.execute("SELECT COUNT(*) AS cnt FROM orders WHERE status='pending'")
+    pending_orders = cur.fetchone()["cnt"]
+
+    cur.execute("SELECT COUNT(*) AS cnt FROM users WHERE is_banned=TRUE")
+    banned_cnt = cur.fetchone()["cnt"]
+
+    cur.execute("""
+        SELECT COUNT(*) AS cnt FROM transactions
+        WHERE type='payment' AND status='pending'
+    """)
+    pending_pays = cur.fetchone()["cnt"]
+
+    cur.execute("""
+        SELECT SUM(total_price) AS total
+        FROM orders
+        WHERE MONTH(created_at)=MONTH(NOW()) AND YEAR(created_at)=YEAR(NOW())
+    """)
+    this_month = cur.fetchone()["total"] or 0
+
+    cur.close(); conn.close()
+
+    total_cmd  = int(fin["total_cmd"]  or 0)
+    total_prev = int(fin["total_prev"] or 0)
+
+    bot.send_message(
+        cid,
+        f"📊 <b>گزارش مالی کلی</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"💰 جمع بدهی ماه جاری:  <b>{total_cmd:,}</b> تومان\n"
+        f"💳 جمع بدهی قبلی:       <b>{total_prev:,}</b> تومان\n"
+        f"📊 جمع کل بدهی‌ها:      <b>{total_cmd+total_prev:,}</b> تومان\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📦 سفارشات این ماه:     <b>{int(this_month):,}</b> تومان\n"
+        f"⏳ سفارش در انتظار:     <b>{pending_orders}</b> مورد\n"
+        f"⏳ پرداخت در انتظار:    <b>{pending_pays}</b> مورد\n"
+        f"🚫 کاربران مسدود:       <b>{banned_cnt}</b> نفر"
+    )
+
+
+# ════════════════════════════════════════════════════════
 #  SCHEDULER - سیستم بن اتوماتیک (شمسی)
 # ════════════════════════════════════════════════════════
 
@@ -1628,4 +2811,4 @@ def start_scheduler():
 
 print("ربات شروع به کار کرد...")
 start_scheduler()
-bot.infinity_polling()  
+bot.infinity_polling()
