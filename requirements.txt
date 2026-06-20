@@ -1,0 +1,3 @@
+pyTelegramBotAPI>=4.14.0
+mysql-connector-python>=8.0.33
+jdatetime>=4.1.1
