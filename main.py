@@ -10,13 +10,12 @@ from telebot.types import (
     InlineKeyboardButton, InlineKeyboardMarkup,
     Message, CallbackQuery
 )
-from telebot.handler_backends import ExceptionHandler
 from config import BOT_TOKEN, DATABASE_CONFIG, DB_NAME, ADMIN_IDS
 
 telebot.apihelper.API_URL = "http://tapi.bale.ai/bot{0}/{1}"
 
 
-class GlobalExceptionHandler(ExceptionHandler):
+class GlobalExceptionHandler(telebot.ExceptionHandler):
     """
     تمام exception هایی که توی handler ها (message/callback) رخ بدن از اینجا رد می‌شن.
     هدف: ربات هیچ‌وقت کرش نکنه و کاربر/ادمین پیام مناسب ببینن.
@@ -116,7 +115,6 @@ def get_connection():
         raise DBError("اتصال به دیتابیس برقرار نشد") from e
 
 
-@db_safe
 def db_safe(func):
     """
     دکوراتور برای همه‌ی توابع db_*.
