@@ -50,9 +50,9 @@ def to_jalali(dt, fmt: str = "%Y/%m/%d") -> str:
     if dt is None:
         return "—"
     try:
-        if hasattr(dt, 'hour'):   # datetime
+        if hasattr(dt, 'hour'):
             return jdatetime.datetime.fromgregorian(datetime=dt).strftime(fmt)
-        else:                     # date
+        else:
             return jdatetime.date.fromgregorian(date=dt).strftime(fmt)
     except Exception:
         return str(dt)
@@ -62,10 +62,7 @@ def to_jalali_full(dt) -> str:
     return to_jalali(dt, "%Y/%m/%d %H:%M")
 
 def jalali_to_gregorian(jalali_str: str) -> str:
-    """
-    تبدیل رشته‌ی شمسی (۱۴۰۳-۰۶-۱۵ یا ۱۴۰۳/۰۶/۱۵) به میلادی (YYYY-MM-DD)
-    برای ذخیره در دیتابیس.
-    """
+    """تبدیل رشته‌ی شمسی (۱۴۰۳-۰۶-۱۵ یا ۱۴۰۳/۰۶/۱۵) به میلادی برای دیتابیس."""
     s = jalali_str.strip().replace("/", "-")
     parts = s.split("-")
     y, m, d = int(parts[0]), int(parts[1]), int(parts[2])
@@ -79,8 +76,7 @@ def validate_jalali(s: str) -> bool:
         parts = s.split("-")
         if len(parts) != 3:
             return False
-        y, m, d = int(parts[0]), int(parts[1]), int(parts[2])
-        jdatetime.date(y, m, d)
+        jdatetime.date(int(parts[0]), int(parts[1]), int(parts[2]))
         return True
     except Exception:
         return False
@@ -930,6 +926,7 @@ def qty_kb():
     return kb
 
 def date_kb():
+    """دکمه‌های پیشنهاد تاریخ تحویل - نمایش شمسی، ذخیره میلادی در callback."""
     kb = InlineKeyboardMarkup(row_width=1)
     today_g = datetime.now()
     for d in [2, 3, 4, 5, 6, 7]:
@@ -1316,8 +1313,7 @@ def _edit_recv_manual_date(message: Message):
     if not validate_jalali(message.text.strip()):
         msg = bot.send_message(cid, "❌ تاریخ شمسی معتبر نیست. فرمت: ۱۴۰۳/۰۶/۱۵")
         bot.register_next_step_handler(msg, _edit_recv_manual_date); return
-    gregorian = jalali_to_gregorian(message.text.strip())
-    _edit_show_confirm(cid, gregorian)
+    _edit_show_confirm(cid, jalali_to_gregorian(message.text.strip()))
 
 def _edit_show_confirm(cid: int, delivery_date: str):
     set_state(cid, S_EDIT_CONFIRM, delivery_date=delivery_date)
@@ -1447,8 +1443,7 @@ def _recv_manual_date(message: Message):
     if not validate_jalali(message.text.strip()):
         msg = bot.send_message(cid, "❌ تاریخ شمسی معتبر نیست. فرمت: ۱۴۰۳/۰۶/۱۵")
         bot.register_next_step_handler(msg, _recv_manual_date); return
-    gregorian = jalali_to_gregorian(message.text.strip())
-    _proceed_to_note(cid, gregorian)
+    _proceed_to_note(cid, jalali_to_gregorian(message.text.strip()))
 
 def _proceed_to_note(cid: int, delivery_date: str):
     set_state(cid, S_ENTER_NOTE, delivery_date=delivery_date)
@@ -2215,7 +2210,6 @@ def _sa_inst_dates(m: Message):
         if not validate_jalali(l):
             msg = bot.send_message(cid, f"❌ تاریخ شمسی معتبر نیست: {l}\nفرمت: ۱۴۰۳/۰۶/۱۵")
             bot.register_next_step_handler(msg, _sa_inst_dates); return
-    # تبدیل همه به میلادی برای ذخیره در دیتابیس
     lines = [jalali_to_gregorian(l) for l in lines]
     admin = db_get_admin(cid)
     iid, err_available = db_add_installment(d["target_uid"], d["inst_total"], d["inst_count"], lines, admin["id"])
