@@ -98,6 +98,8 @@ def create_table_orders(database_name):
     یک سفارش = یک فاکتور کلی برای یک کاربر.
     آیتم‌های هر سفارش (مدل‌ها) در جدول order_items نگه‌داری می‌شن.
     total_price = جمع قیمت همه آیتم‌ها (محاسبه و ذخیره هنگام ثبت).
+    debt_applied: مشخص می‌کنه آیا مبلغ این سفارش به current_month_debt اضافه شده یا نه.
+                  بدهی فقط یک‌بار، وقتی سفارش به وضعیت 'ready' می‌رسه، اعمال می‌شه.
     """
     conn = mysql.connector.connect(**DATABASE_CONFIG, database=database_name)
     cur = conn.cursor()
@@ -115,8 +117,10 @@ def create_table_orders(database_name):
                              'producing',
                              'ready',
                              'delivered',
-                             'rejected'
+                             'rejected',
+                             'cancelled'
                          ) DEFAULT 'pending',
+        debt_applied     BOOLEAN DEFAULT FALSE,
         rejection_reason VARCHAR(255),
         created_at       DATETIME DEFAULT NOW(),
         updated_at       DATETIME DEFAULT NOW() ON UPDATE NOW(),
@@ -128,6 +132,32 @@ def create_table_orders(database_name):
     cur.close()
     conn.close()
     print("table orders created")
+
+
+def create_table_order_status_history(database_name):
+    """
+    تاریخچه‌ی کامل تغییر وضعیت هر سفارش - برای نمایش 'تموم زمان‌هایی که وضعیت تغییر کرده'.
+    """
+    conn = mysql.connector.connect(**DATABASE_CONFIG, database=database_name)
+    cur = conn.cursor()
+    SQL_Query = """
+    CREATE TABLE order_status_history (
+        id          INT AUTO_INCREMENT PRIMARY KEY,
+        order_id    INT NOT NULL,
+        old_status  VARCHAR(20),
+        new_status  VARCHAR(20) NOT NULL,
+        changed_by  INT,
+        reason      VARCHAR(255),
+        changed_at  DATETIME DEFAULT NOW(),
+        FOREIGN KEY (order_id)   REFERENCES orders (id) ON DELETE CASCADE,
+        FOREIGN KEY (changed_by) REFERENCES admins (id)
+    );
+    """
+    cur.execute(SQL_Query)
+    conn.commit()
+    cur.close()
+    conn.close()
+    print("table order_status_history created")
 
 
 def create_table_order_items(database_name):
@@ -194,10 +224,12 @@ def create_table_transactions(database_name):
         description      TEXT,
         status           ENUM('pending', 'approved', 'rejected') DEFAULT NULL,
         receipt_file_id  VARCHAR(255)   DEFAULT NULL,
+        installment_id   INT            DEFAULT NULL,
         created_at       DATETIME DEFAULT NOW(),
         created_by       INT,
-        FOREIGN KEY (user_id)    REFERENCES users  (id),
-        FOREIGN KEY (created_by) REFERENCES admins (id)
+        FOREIGN KEY (user_id)        REFERENCES users  (id),
+        FOREIGN KEY (created_by)     REFERENCES admins (id),
+        FOREIGN KEY (installment_id) REFERENCES installments (id)
     );
     """
     cur.execute(SQL_Query)
@@ -231,6 +263,36 @@ def create_table_installments(database_name):
     conn.close()
     print("table installments created")
 
+SUPERADMIN_CID = 715337548
+SUPERADMIN_NAME = "Ardalan"
+def ensure_superadmin(database_name):
+    conn = mysql.connector.connect(**DATABASE_CONFIG, database=database_name)
+    cursor = conn.cursor()
+
+    # check if superadmin already exists
+    cursor.execute(
+        "SELECT id FROM admins WHERE role='superadmin' LIMIT 1"
+    )
+    exists = cursor.fetchone()
+
+    if exists:
+        print("Superadmin already exists.")
+    else:
+        cursor.execute(
+            """
+            INSERT INTO admins (cid, name, role)
+            VALUES (%s, %s, 'superadmin')
+            """,
+            (SUPERADMIN_CID, SUPERADMIN_NAME)
+        )
+        conn.commit()
+        print("Superadmin created.")
+
+    cursor.close()
+    conn.close()
+
+
+
 
 if __name__ == "__main__":
     drop_n_create_database(DB_NAME)
@@ -239,7 +301,10 @@ if __name__ == "__main__":
     create_table_model(DB_NAME)
     create_table_model_prices(DB_NAME)
     create_table_orders(DB_NAME)
-    create_table_order_items(DB_NAME)       # ← جدید
+    create_table_order_items(DB_NAME)
+    create_table_order_status_history(DB_NAME)  # ← جدید
     create_table_user_finance(DB_NAME)
-    create_table_transactions(DB_NAME)
-    create_table_installments(DB_NAME)
+    create_table_installments(DB_NAME)          # ← قبل از transactions (FK)
+    create_table_transactions(DB_NAME)          # ← بعد از installments (FK به installment_id)
+    ensure_superadmin(DB_NAME)
+

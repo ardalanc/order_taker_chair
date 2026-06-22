@@ -35,8 +35,7 @@ class GlobalExceptionHandler(telebot.ExceptionHandler):
                     pass
         except Exception:
             pass
-        return True  # یعنی خطا handle شد، polling ادامه پیدا کنه
-
+        return True
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML", exception_handler=GlobalExceptionHandler())
 
@@ -337,12 +336,14 @@ def db_get_orders_paged(status_filter: str, offset: int, user_db_id: int = None,
                          show_price: bool = True) -> tuple[list, int]:
     """
     برمی‌گردونه (rows, total_count).
-    status_filter: 'active' | 'rejected' | 'delivered' | 'cancelled' | وضعیت خاص
+    status_filter: 'active' | 'all' | یا یکی از کلیدهای STATUS_FA (وضعیت خاص)
     """
     conn = get_connection(); cur = conn.cursor(dictionary=True)
 
     if status_filter == "active":
         where = "o.status NOT IN ('delivered','rejected','cancelled')"
+    elif status_filter == "all":
+        where = "1=1"
     elif status_filter in STATUS_FA:
         where = f"o.status='{status_filter}'"
     else:
@@ -370,6 +371,7 @@ def db_get_orders_paged(status_filter: str, offset: int, user_db_id: int = None,
 
 @db_safe
 def db_get_order_full(order_id: int):
+    """جزئیات کامل سفارش + آیتم‌ها + کامل تاریخچه‌ی تغییر وضعیت."""
     conn = get_connection(); cur = conn.cursor(dictionary=True)
     cur.execute("SELECT * FROM orders WHERE id=%s", (order_id,)); order = cur.fetchone()
     if order:
@@ -378,6 +380,12 @@ def db_get_order_full(order_id: int):
             FROM order_items oi JOIN models m ON m.id=oi.model_id
             WHERE oi.order_id=%s
         """, (order_id,)); order["items"] = cur.fetchall()
+        cur.execute("""
+            SELECT h.*, a.name AS admin_name
+            FROM order_status_history h
+            LEFT JOIN admins a ON a.id=h.changed_by
+            WHERE h.order_id=%s ORDER BY h.changed_at ASC
+        """, (order_id,)); order["history"] = cur.fetchall()
     cur.close(); conn.close(); return order
 
 @db_safe
@@ -392,6 +400,11 @@ def db_get_order_items_no_price(order_id: int):
 
 @db_safe
 def db_create_order(user_db_id, total_price, fabric, delivery_date, note, items) -> int:
+    """
+    سفارش ثبت می‌شه ولی به بدهی کاربر اضافه نمی‌شه.
+    بدهی فقط وقتی اضافه می‌شه که سفارش به وضعیت 'ready' (آماده تحویل) برسه
+    - چون قبل از اون مشخص نیست سفارش قطعاً انجام می‌شه یا نه (ممکنه رد/لغو بشه).
+    """
     conn = get_connection(); cur = conn.cursor()
     cur.execute("""
         INSERT INTO orders (user_id,total_price,fabric,delivery_date,note)
@@ -403,56 +416,109 @@ def db_create_order(user_db_id, total_price, fabric, delivery_date, note, items)
             INSERT INTO order_items (order_id,model_id,quantity,unit_price,line_total)
             VALUES(%s,%s,%s,%s,%s)
         """, (oid, item["model_id"], item["quantity"], item["unit_price"], item["line_total"]))
+    # رکورد در user_finance ساخته بشه اگه نبود (مقدار صفر) تا بعداً قابل آپدیت باشه
     cur.execute("""
-        INSERT INTO user_finance (user_id,current_month_debt) VALUES(%s,%s)
-        ON DUPLICATE KEY UPDATE current_month_debt=current_month_debt+%s
-    """, (user_db_id, total_price, total_price))
-    cur.execute("""
-        INSERT INTO transactions (user_id,type,amount,description)
-        VALUES(%s,'order',%s,%s)
-    """, (user_db_id, total_price, f"سفارش #{oid}"))
+        INSERT INTO user_finance (user_id) VALUES(%s)
+        ON DUPLICATE KEY UPDATE user_id=user_id
+    """, (user_db_id,))
     conn.commit(); cur.close(); conn.close(); return oid
 
 @db_safe
-def db_update_order_status(order_id: int, status: str, reason: str = None):
-    conn = get_connection(); cur = conn.cursor()
+
+
+def db_update_order_status(order_id: int, status: str, reason: str = None, admin_db_id: int = None):
+    """
+    تغییر وضعیت سفارش + ثبت در تاریخچه (order_status_history).
+    اگه وضعیت جدید 'ready' باشه و قبلاً بدهی اضافه نشده بود (debt_applied=FALSE)،
+    مبلغ سفارش به current_month_debt اضافه می‌شه.
+    """
+    conn = get_connection(); cur = conn.cursor(dictionary=True)
+    cur.execute("SELECT * FROM orders WHERE id=%s FOR UPDATE", (order_id,))
+    order = cur.fetchone()
+    if not order:
+        cur.close(); conn.close(); return False
+
+    old_status = order["status"]
+
     if reason:
         cur.execute("UPDATE orders SET status=%s,rejection_reason=%s WHERE id=%s",
                     (status, reason, order_id))
     else:
         cur.execute("UPDATE orders SET status=%s WHERE id=%s", (status, order_id))
-    conn.commit(); cur.close(); conn.close()
+
+    # ثبت تاریخچه
+    cur.execute("""
+        INSERT INTO order_status_history (order_id, old_status, new_status, changed_by, reason)
+        VALUES(%s,%s,%s,%s,%s)
+    """, (order_id, old_status, status, admin_db_id, reason))
+
+    # اضافه کردن بدهی فقط یک‌بار، وقتی به ready می‌رسه
+    if status == "ready" and not order.get("debt_applied"):
+        amount = int(order["total_price"])
+        cur.execute("""
+            INSERT INTO user_finance (user_id,current_month_debt) VALUES(%s,%s)
+            ON DUPLICATE KEY UPDATE current_month_debt=current_month_debt+%s
+        """, (order["user_id"], amount, amount))
+        cur.execute("UPDATE orders SET debt_applied=TRUE WHERE id=%s", (order_id,))
+        cur.execute("""
+            INSERT INTO transactions (user_id,type,amount,description)
+            VALUES(%s,'order',%s,%s)
+        """, (order["user_id"], amount, f"سفارش #{order_id} آماده تحویل - بدهی ثبت شد"))
+
+    conn.commit(); cur.close(); conn.close(); return True
 
 @db_safe
-def db_cancel_order(order_id: int, user_db_id: int):
-    """لغو سفارش و برگشت مبلغ از بدهی ماه جاری."""
+def db_cancel_order(order_id: int, user_db_id: int = None, admin_db_id: int = None):
+    """
+    لغو سفارش. اگه کاربر لغو می‌کنه user_db_id رو بده (فقط سفارش خودش، فقط pending).
+    اگه ادمین لغو می‌کنه admin_db_id رو بده (هر وضعیتی، چون سوپرادمین مجازه).
+    اگه بدهی این سفارش قبلاً اعمال شده بود (debt_applied=TRUE، یعنی به ready رسیده بود)
+    برگشت داده می‌شه، وگرنه نیازی به برگشت نیست چون اصلاً اضافه نشده بود.
+    """
     conn = get_connection(); cur = conn.cursor(dictionary=True)
-    cur.execute("SELECT total_price,status FROM orders WHERE id=%s AND user_id=%s",
-                (order_id, user_db_id))
-    order = cur.fetchone()
-    if not order or order["status"] != "pending":
-        cur.close(); conn.close(); return False
-    amount = int(order["total_price"])
+    if user_db_id:
+        cur.execute("SELECT * FROM orders WHERE id=%s AND user_id=%s FOR UPDATE",
+                    (order_id, user_db_id))
+        order = cur.fetchone()
+        if not order or order["status"] != "pending":
+            cur.close(); conn.close(); return False
+    else:
+        cur.execute("SELECT * FROM orders WHERE id=%s FOR UPDATE", (order_id,))
+        order = cur.fetchone()
+        if not order:
+            cur.close(); conn.close(); return False
+
+    target_user_id = order["user_id"]
+    old_status = order["status"]
+
     cur.execute("UPDATE orders SET status='cancelled' WHERE id=%s", (order_id,))
     cur.execute("""
-        UPDATE user_finance SET current_month_debt=GREATEST(0,current_month_debt-%s)
-        WHERE user_id=%s
-    """, (amount, user_db_id))
-    cur.execute("""
-        INSERT INTO transactions (user_id,type,amount,description)
-        VALUES(%s,'payment',%s,%s)
-    """, (user_db_id, amount, f"لغو سفارش #{order_id} - برگشت وجه"))
+        INSERT INTO order_status_history (order_id, old_status, new_status, changed_by, reason)
+        VALUES(%s,%s,'cancelled',%s,'لغو سفارش')
+    """, (order_id, old_status, admin_db_id))
+
+    if order.get("debt_applied"):
+        amount = int(order["total_price"])
+        cur.execute("""
+            UPDATE user_finance SET current_month_debt=GREATEST(0,current_month_debt-%s)
+            WHERE user_id=%s
+        """, (amount, target_user_id))
+        cur.execute("""
+            INSERT INTO transactions (user_id,type,amount,description)
+            VALUES(%s,'payment',%s,%s)
+        """, (target_user_id, amount, f"لغو سفارش #{order_id} - برگشت وجه"))
+
     conn.commit(); cur.close(); conn.close(); return True
 
 @db_safe
 def db_update_order_items(order_id: int, fabric: str, delivery_date: str,
                            items: list, new_total: int, user_db_id: int):
-    """ویرایش سفارش pending - آیتم‌ها + پارچه + تاریخ."""
-    conn = get_connection(); cur = conn.cursor(dictionary=True)
-    cur.execute("SELECT total_price FROM orders WHERE id=%s", (order_id,))
-    old_total = int(cur.fetchone()["total_price"])
-    diff = new_total - old_total
-
+    """
+    ویرایش سفارش pending - آیتم‌ها + پارچه + تاریخ.
+    چون ویرایش فقط روی سفارش‌های pending مجازه (و بدهی فقط در وضعیت ready اعمال می‌شه)
+    اینجا نیازی به دستکاری بدهی نیست - فقط total_price آپدیت می‌شه.
+    """
+    conn = get_connection(); cur = conn.cursor()
     cur.execute("DELETE FROM order_items WHERE order_id=%s", (order_id,))
     for item in items:
         cur.execute("""
@@ -463,11 +529,6 @@ def db_update_order_items(order_id: int, fabric: str, delivery_date: str,
         UPDATE orders SET fabric=%s,delivery_date=%s,total_price=%s,status='pending'
         WHERE id=%s
     """, (fabric, delivery_date, new_total, order_id))
-    if diff != 0:
-        cur.execute("""
-            UPDATE user_finance SET current_month_debt=GREATEST(0,current_month_debt+%s)
-            WHERE user_id=%s
-        """, (diff, user_db_id))
     conn.commit(); cur.close(); conn.close()
 
 # ── مالی ────────────────────────────────────────────────────────
@@ -510,21 +571,57 @@ def db_get_transaction_by_id(tx_id: int):
     row = cur.fetchone(); cur.close(); conn.close(); return row
 
 @db_safe
-def db_create_payment_request(user_db_id: int, amount: int, file_id: str) -> int:
+def db_create_payment_request(user_db_id: int, amount: int, file_id: str,
+                               installment_id: int = None) -> int:
+    """
+    درخواست پرداخت. اگه installment_id داده بشه یعنی این پرداخت برای یک قسط خاصه
+    (پرداخت قسط با پرداخت عادی بدهی فرق می‌کنه: فقط previous_debt و paid_amount آپدیت می‌شه).
+    """
     conn = get_connection(); cur = conn.cursor()
+    desc = "درخواست پرداخت قسط - در انتظار تایید" if installment_id else "درخواست پرداخت در انتظار تایید"
     cur.execute("""
-        INSERT INTO transactions (user_id,type,amount,description,status,receipt_file_id)
-        VALUES(%s,'payment',%s,'درخواست پرداخت در انتظار تایید','pending',%s)
-    """, (user_db_id, amount, file_id))
+        INSERT INTO transactions (user_id,type,amount,description,status,receipt_file_id,installment_id)
+        VALUES(%s,'payment',%s,%s,'pending',%s,%s)
+    """, (user_db_id, amount, desc, file_id, installment_id))
     tx_id = cur.lastrowid; conn.commit(); cur.close(); conn.close(); return tx_id
 
 @db_safe
 def db_approve_payment(tx_id: int, admin_db_id: int) -> dict:
+    """
+    تایید پرداخت.
+    - اگه installment_id داره: فقط previous_debt و installments.paid_amount آپدیت می‌شه
+      (current_month_debt دست نمی‌خوره).
+    - اگه نداره: پرداخت عادیه - اول از current_month_debt، مازاد از previous_debt.
+    """
     conn = get_connection(); cur = conn.cursor(dictionary=True)
     cur.execute("SELECT * FROM transactions WHERE id=%s", (tx_id,)); tx = cur.fetchone()
     if not tx or tx["status"] != "pending":
         cur.close(); conn.close(); return None
     user_db_id = tx["user_id"]; amount = int(tx["amount"])
+
+    if tx.get("installment_id"):
+        # ── پرداخت قسط ──
+        inst_id = tx["installment_id"]
+        cur.execute("SELECT * FROM installments WHERE id=%s FOR UPDATE", (inst_id,))
+        inst = cur.fetchone()
+        cur.execute("SELECT * FROM user_finance WHERE user_id=%s FOR UPDATE", (user_db_id,))
+        fin = cur.fetchone()
+        prev = int(fin["previous_debt"]) if fin else 0
+        new_paid = int(inst["paid_amount"]) + amount
+        new_prev = max(0, prev - amount)
+        cur.execute("UPDATE installments SET paid_amount=%s WHERE id=%s", (new_paid, inst_id))
+        cur.execute("UPDATE user_finance SET previous_debt=%s WHERE user_id=%s", (new_prev, user_db_id))
+        cur.execute("""
+            UPDATE transactions SET status='approved',created_by=%s,description=%s WHERE id=%s
+        """, (admin_db_id, f"پرداخت قسط تایید شد | مبلغ:{amount:,}", tx_id))
+        conn.commit(); cur.close(); conn.close()
+        return {"user_db_id": user_db_id, "amount": amount, "is_installment": True,
+                "paid_current": 0, "paid_previous": amount,
+                "new_cmd": int(fin["current_month_debt"]) if fin else 0,
+                "new_prev": new_prev, "installment_id": inst_id,
+                "installment_remaining": int(inst["total_amount"]) - new_paid}
+
+    # ── پرداخت عادی ──
     cur.execute("SELECT * FROM user_finance WHERE user_id=%s FOR UPDATE", (user_db_id,))
     fin = cur.fetchone()
     cmd  = int(fin["current_month_debt"]) if fin else 0
@@ -539,7 +636,7 @@ def db_approve_payment(tx_id: int, admin_db_id: int) -> dict:
         description=%s WHERE id=%s
     """, (admin_db_id, f"تایید شد | ماه جاری:{paid_current:,} | قبلی:{paid_previous:,}", tx_id))
     conn.commit(); cur.close(); conn.close()
-    return {"user_db_id": user_db_id, "amount": amount,
+    return {"user_db_id": user_db_id, "amount": amount, "is_installment": False,
             "paid_current": paid_current, "paid_previous": paid_previous,
             "new_cmd": cmd-paid_current, "new_prev": prev-paid_previous}
 
@@ -585,15 +682,48 @@ def db_transfer_debt_to_previous(user_db_id: int, admin_db_id: int) -> int:
     conn.commit(); cur.close(); conn.close(); return amount
 
 @db_safe
+
+def db_get_active_installments_sum(user_db_id: int) -> int:
+    """مجموع مونده‌ی اقساط فعال (بخشی از previous_debt که قسط‌بندی شده و هنوز کامل پرداخت نشده)."""
+    conn = get_connection(); cur = conn.cursor(dictionary=True)
+    cur.execute("""
+        SELECT COALESCE(SUM(total_amount - paid_amount),0) AS s
+        FROM installments WHERE user_id=%s AND paid_amount < total_amount
+    """, (user_db_id,))
+    row = cur.fetchone(); cur.close(); conn.close()
+    return int(row["s"])
+
+@db_safe
 def db_add_installment(user_db_id: int, total: int, count: int,
-                        due_dates: list, admin_db_id: int) -> int:
-    conn = get_connection(); cur = conn.cursor()
+                        due_dates: list, admin_db_id: int):
+    """
+    قسط‌بندی جدید. مبلغ قسط‌بندی نمی‌تونه از (previous_debt - مجموع اقساط فعال قبلی) بیشتر باشه
+    چون نباید بیشتر از بدهی قبلیِ "آزاد" (قسط‌بندی نشده) رو قسط بست.
+    برمی‌گردونه: (installment_id, None) موفق یا (None, error_message) ناموفق.
+    """
+    conn = get_connection(); cur = conn.cursor(dictionary=True)
+    cur.execute("SELECT previous_debt FROM user_finance WHERE user_id=%s FOR UPDATE", (user_db_id,))
+    fin = cur.fetchone()
+    prev_debt = int(fin["previous_debt"]) if fin else 0
+
+    cur.execute("""
+        SELECT COALESCE(SUM(total_amount - paid_amount),0) AS s
+        FROM installments WHERE user_id=%s AND paid_amount < total_amount
+    """, (user_db_id,))
+    already_installed = int(cur.fetchone()["s"])
+
+    available = prev_debt - already_installed
+    if total > available:
+        cur.close(); conn.close()
+        return None, available
+
     per = total // count
     cur.execute("""
         INSERT INTO installments (user_id,total_amount,num_installments,per_installment,due_dates,created_by)
         VALUES(%s,%s,%s,%s,%s,%s)
     """, (user_db_id, total, count, per, json.dumps(due_dates), admin_db_id))
-    iid = cur.lastrowid; conn.commit(); cur.close(); conn.close(); return iid
+    iid = cur.lastrowid; conn.commit(); cur.close(); conn.close()
+    return iid, None
 
 # ── گزارش scheduler ──────────────────────────────────────────────
 
@@ -746,17 +876,17 @@ def models_kb(models, selected_ids):
 
 def qty_kb():
     kb = InlineKeyboardMarkup(row_width=3)
-    kb.add(InlineKeyboardButton("۱",  callback_data="qty_1"),
-           InlineKeyboardButton("۵",  callback_data="qty_5"),
-           InlineKeyboardButton("۱۰", callback_data="qty_10"),
-           InlineKeyboardButton("۲۰", callback_data="qty_20"),
-           InlineKeyboardButton("۵۰", callback_data="qty_50"),
+    kb.add(InlineKeyboardButton("2",  callback_data="qty_2"),
+           InlineKeyboardButton("4",  callback_data="qty_4"),
+           InlineKeyboardButton("6", callback_data="qty_6"),
+           InlineKeyboardButton("8", callback_data="qty_8"),
+           InlineKeyboardButton("10", callback_data="qty_10"),
            InlineKeyboardButton("✏️ دستی", callback_data="qty_manual"))
     return kb
 
 def date_kb():
     kb = InlineKeyboardMarkup(row_width=1); today = datetime.now()
-    for d in [7, 14, 21, 30]:
+    for d in [2, 3, 4, 5, 6, 7]:
         dt = today + timedelta(days=d)
         kb.add(InlineKeyboardButton(f"{dt.strftime('%Y/%m/%d')} ({d} روز)",
                                     callback_data=f"date_{dt.strftime('%Y-%m-%d')}"))
@@ -774,6 +904,7 @@ def order_filter_kb(prefix: str = "of"):
     kb = InlineKeyboardMarkup(row_width=2)
     kb.add(
         InlineKeyboardButton("🔄 فعال",          callback_data=f"{prefix}_active_0"),
+        InlineKeyboardButton("📜 نمایش همه",     callback_data=f"{prefix}_all_0"),
         InlineKeyboardButton("⏳ در انتظار",     callback_data=f"{prefix}_pending_0"),
         InlineKeyboardButton("✅ تایید شده",     callback_data=f"{prefix}_approved_0"),
         InlineKeyboardButton("🔧 در تولید",      callback_data=f"{prefix}_producing_0"),
@@ -784,19 +915,36 @@ def order_filter_kb(prefix: str = "of"):
     )
     return kb
 
-def order_status_change_kb(order_id: int, is_super: bool = False):
+# ترتیب منطقی مراحل سفارش - برای دکمه‌ی "مرحله بعد"
+ORDER_STAGE_FLOW = ["pending", "approved", "producing", "ready", "delivered"]
+ORDER_STAGE_NEXT = {
+    ORDER_STAGE_FLOW[i]: ORDER_STAGE_FLOW[i+1] for i in range(len(ORDER_STAGE_FLOW)-1)
+}
+
+def order_status_change_kb(order_id: int, current_status: str, is_super: bool = False):
+    """
+    فقط دکمه‌ی مرحله‌ی بعدی منطقی (طبق ORDER_STAGE_FLOW) رو نشون می‌ده،
+    به‌علاوه‌ی دکمه‌ی رد/لغو در مراحل مناسب.
+    - مرحله‌ی بعد: فقط اگه وضعیت فعلی در جریان عادی باشه (نه delivered/rejected/cancelled)
+    - رد سفارش: فقط در pending
+    - لغو سفارش: در pending و approved (طبق درخواست) + هر وضعیتی برای سوپرادمین
+    """
     kb = InlineKeyboardMarkup(row_width=2)
-    statuses = [
-        ("✅ تایید",         "approved"),
-        ("🔧 در حال تولید", "producing"),
-        ("📦 آماده تحویل",  "ready"),
-        ("🚚 تحویل شد",     "delivered"),
-        ("❌ رد سفارش",     "rejected"),
-    ]
-    if is_super:
-        statuses.append(("🚫 لغو",  "cancelled"))
-    for lbl, st in statuses:
-        kb.add(InlineKeyboardButton(lbl, callback_data=f"adm_st_{order_id}_{st}"))
+
+    next_status = ORDER_STAGE_NEXT.get(current_status)
+    if next_status:
+        kb.add(InlineKeyboardButton(f"➡️ {STATUS_FA[next_status]}",
+                                    callback_data=f"adm_st_{order_id}_{next_status}"))
+
+    if current_status == "pending":
+        kb.add(InlineKeyboardButton("❌ رد سفارش", callback_data=f"adm_st_{order_id}_rejected"))
+
+    if current_status in ("pending", "approved"):
+        kb.add(InlineKeyboardButton("🚫 لغو سفارش", callback_data=f"adm_st_{order_id}_cancelled"))
+    elif is_super and current_status not in ("delivered", "cancelled"):
+        # سوپرادمین می‌تونه در هر مرحله‌ی دیگه‌ای هم لغو کنه
+        kb.add(InlineKeyboardButton("🚫 لغو سفارش", callback_data=f"adm_st_{order_id}_cancelled"))
+
     return kb
 
 def admin_order_kb(order_id: int):
@@ -812,11 +960,12 @@ def admin_payment_kb(tx_id: int):
     return kb
 
 def user_order_actions_kb(order_id: int, status: str):
+    """دکمه‌های زیر جزئیات سفارش کاربر - فقط اگه pending باشه ویرایش/لغو داره."""
+    if status != "pending":
+        return None
     kb = InlineKeyboardMarkup(row_width=2)
-    kb.add(InlineKeyboardButton("🔍 جزئیات کامل", callback_data=f"uord_detail_{order_id}"))
-    if status == "pending":
-        kb.add(InlineKeyboardButton("✏️ ویرایش",   callback_data=f"uord_edit_{order_id}"),
-               InlineKeyboardButton("🚫 لغو",       callback_data=f"uord_cancel_{order_id}"))
+    kb.add(InlineKeyboardButton("✏️ ویرایش", callback_data=f"uord_edit_{order_id}"),
+           InlineKeyboardButton("🚫 لغو",     callback_data=f"uord_cancel_{order_id}"))
     return kb
 
 def sa_users_kb(users):
@@ -929,7 +1078,7 @@ def btn_my_orders(message: Message):
     bot.send_message(cid, "📋 <b>سفارش‌های من</b>\nفیلتر انتخاب کن:",
                      reply_markup=order_filter_kb("uo"))
 
-@bot.callback_query_handler(func=lambda c: c.data.startswith("uo_"))
+@bot.callback_query_handler(func=lambda c: c.data.startswith("uo_") and c.data != "uo_back_filters")
 @safe_handler
 def cb_user_orders(call: CallbackQuery):
     cid = call.message.chat.id
@@ -986,6 +1135,11 @@ def cb_user_order_detail(call: CallbackQuery):
             f"{summary}")
     if order.get("rejection_reason"):
         text += f"\n\n❌ دلیل رد: {order['rejection_reason']}"
+    if order.get("history"):
+        text += "\n\n📜 <b>تاریخچه‌ی وضعیت:</b>"
+        for h in order["history"]:
+            ts = h["changed_at"].strftime("%m/%d %H:%M")
+            text += f"\n  • {STATUS_FA.get(h['new_status'], h['new_status'])}  |  {ts}"
 
     bot.send_message(cid, text, reply_markup=user_order_actions_kb(order_id, order["status"]))
 
@@ -1310,12 +1464,15 @@ def btn_finance(message: Message):
     fin = db_get_user_finance(user["id"])
     cmd = int(fin["current_month_debt"]) if fin else 0
     prv = int(fin["previous_debt"])      if fin else 0
+    locked = db_get_active_installments_sum(user["id"])
     pnd = db_get_pending_payments(user["id"])
     pnd_sum = sum(int(p["amount"]) for p in pnd)
     text = (f"💰 <b>بخش مالی</b>\n━━━━━━━━━━━━━━━━━━━━\n"
             f"📅 بدهی ماه جاری: <b>{cmd:,}</b> تومان\n"
-            f"💳 بدهی قبلی:     <b>{prv:,}</b> تومان\n"
-            f"📊 جمع کل:        <b>{cmd+prv:,}</b> تومان")
+            f"💳 بدهی قبلی:     <b>{prv:,}</b> تومان\n")
+    if locked:
+        text += f"   └ از این مقدار، <b>{locked:,}</b> تومان قسط‌بندی شده (از «اقساط من» پرداخت کنید)\n"
+    text += f"📊 جمع کل:        <b>{cmd+prv:,}</b> تومان"
     if pnd_sum: text += f"\n⏳ در انتظار تایید: <b>{pnd_sum:,}</b> تومان"
     text += "\n━━━━━━━━━━━━━━━━━━━━"
     bot.send_message(cid, text, reply_markup=finance_main_kb())
@@ -1351,11 +1508,36 @@ def cb_fin_inst(call: CallbackQuery):
     insts = db_get_installments(user["id"])
     if not insts: bot.send_message(cid, "📋 هیچ قسط فعالی ندارید."); return
     lines = ["📋 <b>اقساط فعال:</b>\n"]
+    kb = InlineKeyboardMarkup(row_width=1)
     for i, inst in enumerate(insts, 1):
         remain = int(inst["total_amount"]) - int(inst["paid_amount"])
         lines.append(f"{i}. کل:{int(inst['total_amount']):,}  |  باقی:<b>{remain:,}</b>\n"
                      f"   {inst['num_installments']} قسط × {int(inst['per_installment']):,}")
-    bot.send_message(cid, "\n".join(lines))
+        kb.add(InlineKeyboardButton(f"💳 پرداخت قسط #{inst['id']} (باقی:{remain:,})",
+                                    callback_data=f"fin_pay_inst_{inst['id']}"))
+    bot.send_message(cid, "\n".join(lines), reply_markup=kb)
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("fin_pay_inst_"))
+@safe_handler
+def cb_fin_pay_inst(call: CallbackQuery):
+    """شروع فلوی پرداخت برای یک قسط مشخص."""
+    cid = call.message.chat.id; user = db_get_user(cid)
+    if not user: bot.answer_callback_query(call.id,"⛔️"); return
+    inst_id = int(call.data.split("_")[3])
+    insts = db_get_installments(user["id"])
+    inst = next((i for i in insts if i["id"] == inst_id), None)
+    if not inst:
+        bot.answer_callback_query(call.id, "❌ قسط پیدا نشد یا قبلاً تکمیل شده."); return
+    remain = int(inst["total_amount"]) - int(inst["paid_amount"])
+    if remain <= 0:
+        bot.answer_callback_query(call.id, "✅ این قسط قبلاً کامل پرداخت شده."); return
+    bot.answer_callback_query(call.id)
+    set_state(cid, S_PAY_AMOUNT, max_pay=remain, cmd=0, prv=remain, installment_id=inst_id)
+    msg = bot.send_message(cid,
+        f"💳 <b>پرداخت قسط #{inst_id}</b>\n"
+        f"باقی‌مانده‌ی این قسط: <b>{remain:,}</b> تومان\n\n"
+        f"مبلغ پرداختی (تومان):")
+    bot.register_next_step_handler(msg, _recv_pay_amount)
 
 @bot.callback_query_handler(func=lambda c: c.data == "fin_pending")
 @safe_handler
@@ -1373,18 +1555,33 @@ def cb_fin_pending(call: CallbackQuery):
 @bot.callback_query_handler(func=lambda c: c.data == "fin_new_pay")
 @safe_handler
 def cb_fin_new_pay(call: CallbackQuery):
+    """
+    پرداخت عادی بدهی (ماه جاری + بدهی قبلیِ آزاد).
+    بخشی از previous_debt که قسط‌بندی شده، اینجا قابل پرداخت نیست -
+    باید از طریق دکمه‌ی «پرداخت این قسط» در لیست اقساط پرداخت بشه.
+    """
     cid = call.message.chat.id; user = db_get_user(cid)
     if not user: bot.answer_callback_query(call.id,"⛔️"); return
     fin = db_get_user_finance(user["id"])
     cmd = int(fin["current_month_debt"]) if fin else 0
     prv = int(fin["previous_debt"])      if fin else 0
-    total = cmd + prv
-    if total <= 0: bot.answer_callback_query(call.id,"✅ بدهی ندارید!"); return
+    locked = db_get_active_installments_sum(user["id"])
+    prv_available = max(0, prv - locked)
+    total = cmd + prv_available
+    if total <= 0:
+        bot.answer_callback_query(call.id,"✅ بدهی آزاد ندارید!")
+        if locked > 0:
+            bot.send_message(cid,
+                f"✅ بدهی ماه جاری و بدهی قبلیِ آزاد شما صفره.\n"
+                f"⚠️ توجه: {locked:,} تومان از بدهی قبلیتون قسط‌بندی شده — "
+                f"اون رو از «📋 اقساط من» پرداخت کنید.")
+        return
     bot.answer_callback_query(call.id)
-    set_state(cid, S_PAY_AMOUNT, max_pay=total, cmd=cmd, prv=prv)
+    set_state(cid, S_PAY_AMOUNT, max_pay=total, cmd=cmd, prv=prv_available, installment_id=None)
+    extra = f"\n⚠️ {locked:,} تومان از بدهی قبلی قسط‌بندی شده و اینجا قابل پرداخت نیست." if locked else ""
     msg = bot.send_message(cid,
-        f"💳 <b>ثبت پرداخت</b>\n\n📅 ماه جاری: {cmd:,}\n💳 قبلی: {prv:,}\n"
-        f"حداکثر: <b>{total:,}</b>\n\nمبلغ پرداختی (تومان):")
+        f"💳 <b>ثبت پرداخت</b>\n\n📅 ماه جاری: {cmd:,}\n💳 قبلیِ آزاد: {prv_available:,}\n"
+        f"حداکثر: <b>{total:,}</b>{extra}\n\nمبلغ پرداختی (تومان):")
     bot.register_next_step_handler(msg, _recv_pay_amount)
 
 @safe_handler
@@ -1400,10 +1597,18 @@ def _recv_pay_amount(message: Message):
     if amount > d["max_pay"]:
         msg = bot.send_message(cid, f"❌ حداکثر {d['max_pay']:,} تومان:")
         bot.register_next_step_handler(msg, _recv_pay_amount); return
-    pc = min(amount, d["cmd"]); pp = min(amount - pc, d["prv"])
-    set_state(cid, S_PAY_RECEIPT, pay_amount=amount, paid_current=pc, paid_previous=pp)
-    msg = bot.send_message(cid,
-        f"💡 از ماه جاری: {pc:,}  |  از قبلی: {pp:,}\n\n📎 فیش واریزی رو ارسال کن:")
+
+    if d.get("installment_id"):
+        # پرداخت قسط: کل مبلغ مستقیم از همون قسط/بدهی قبلی کسر می‌شه، تفکیک ماه‌جاری/قبلی معنی نداره
+        set_state(cid, S_PAY_RECEIPT, pay_amount=amount, paid_current=0, paid_previous=amount)
+        msg = bot.send_message(cid,
+            f"💡 این مبلغ بابت قسط #{d['installment_id']} از بدهی قبلی کسر می‌شه.\n\n"
+            f"📎 فیش واریزی رو ارسال کن:")
+    else:
+        pc = min(amount, d["cmd"]); pp = min(amount - pc, d["prv"])
+        set_state(cid, S_PAY_RECEIPT, pay_amount=amount, paid_current=pc, paid_previous=pp)
+        msg = bot.send_message(cid,
+            f"💡 از ماه جاری: {pc:,}  |  از قبلی: {pp:,}\n\n📎 فیش واریزی رو ارسال کن:")
     bot.register_next_step_handler(msg, _recv_receipt)
 
 @safe_handler
@@ -1431,12 +1636,17 @@ def cb_pay_submit(call: CallbackQuery):
         bot.answer_callback_query(call.id,"⚠️"); return
     bot.answer_callback_query(call.id,"⏳ ارسال...")
     d = get_state(cid)["data"]; user = db_get_user(cid)
-    tx_id = db_create_payment_request(user["id"], d["pay_amount"], d["receipt_file_id"])
+    inst_id = d.get("installment_id")
+    tx_id = db_create_payment_request(user["id"], d["pay_amount"], d["receipt_file_id"], inst_id)
     clear_state(cid)
     bot.send_message(cid, f"✅ <b>درخواست #{tx_id} ارسال شد.</b>\nمنتظر تایید ادمین باش.",
                      reply_markup=main_menu_kb())
-    cap = (f"🔔 <b>پرداخت جدید #{tx_id}</b>\n👤 {user['name']}\n"
-           f"💵 {d['pay_amount']:,} تومان\n  └ ماه جاری:{d['paid_current']:,}\n  └ قبلی:{d['paid_previous']:,}")
+    if inst_id:
+        cap = (f"🔔 <b>پرداخت قسط جدید #{tx_id}</b>\n👤 {user['name']}\n"
+               f"📋 قسط #{inst_id}\n💵 {d['pay_amount']:,} تومان")
+    else:
+        cap = (f"🔔 <b>پرداخت جدید #{tx_id}</b>\n👤 {user['name']}\n"
+               f"💵 {d['pay_amount']:,} تومان\n  └ ماه جاری:{d['paid_current']:,}\n  └ قبلی:{d['paid_previous']:,}")
     for ac in ADMIN_IDS:
         try:
             bot.send_photo(ac, d["receipt_file_id"], caption=cap, reply_markup=admin_payment_kb(tx_id))
@@ -1459,9 +1669,9 @@ def cb_pay_cancel(call: CallbackQuery):
 def btn_admin_orders(message: Message):
     cid = message.chat.id
     if not _is_admin(cid): bot.send_message(cid,"⛔️"); return
-    bot.send_message(cid, "📋 <b>سفارشات</b>\nفیلتر:", reply_markup=order_filter_kb("ao"))
+    bot.send_message(cid, "📋 <b>سفارشات</b>\nفیلتر:", reply_markup=order_filter_kb("aord"))
 
-@bot.callback_query_handler(func=lambda c: c.data.startswith("ao_"))
+@bot.callback_query_handler(func=lambda c: c.data.startswith("aord_") and c.data != "aord_back_filters")
 @safe_handler
 def cb_admin_orders(call: CallbackQuery):
     cid = call.message.chat.id
@@ -1477,27 +1687,28 @@ def cb_admin_orders(call: CallbackQuery):
     for o in orders:
         st_e = STATUS_EMOJI.get(o["status"],"•")
         price_part = f"  |  {int(o['total_price']):,}ت" if is_super and "total_price" in o else ""
-        lbl = f"{st_e} #{o['id']} {o['user_name']} {o['created_at'].strftime('%m/%d')}{price_part}"
-        kb.add(InlineKeyboardButton(lbl, callback_data=f"ao_detail_{o['id']}"))
+        delivery = o['delivery_date'].strftime('%m/%d') if o.get('delivery_date') else "—"
+        lbl = f"{st_e} #{o['id']} {o['user_name']}  📅{delivery}{price_part}"
+        kb.add(InlineKeyboardButton(lbl, callback_data=f"aodet_{o['id']}"))
 
-    pag = _paginate_kb(offset, total, f"ao_{status}_{offset-PAGE_SIZE}", f"ao_{status}_{offset+PAGE_SIZE}")
+    pag = _paginate_kb(offset, total, f"aord_{status}_{offset-PAGE_SIZE}", f"aord_{status}_{offset+PAGE_SIZE}")
     if pag: kb.add(*pag)
-    kb.add(InlineKeyboardButton("🔙 فیلترها", callback_data="ao_back_filters"))
+    kb.add(InlineKeyboardButton("🔙 فیلترها", callback_data="aord_back_filters"))
     bot.send_message(cid, f"📋 <b>{STATUS_FA.get(status,'سفارشات')}</b>  ({min(offset+PAGE_SIZE,total)}/{total})",
                      reply_markup=kb)
 
-@bot.callback_query_handler(func=lambda c: c.data == "ao_back_filters")
+@bot.callback_query_handler(func=lambda c: c.data == "aord_back_filters")
 @safe_handler
 def cb_ao_back(call: CallbackQuery):
     bot.answer_callback_query(call.id)
-    bot.send_message(call.message.chat.id, "📋 فیلتر:", reply_markup=order_filter_kb("ao"))
+    bot.send_message(call.message.chat.id, "📋 فیلتر:", reply_markup=order_filter_kb("aord"))
 
-@bot.callback_query_handler(func=lambda c: c.data.startswith("ao_detail_"))
+@bot.callback_query_handler(func=lambda c: c.data.startswith("aodet_"))
 @safe_handler
 def cb_admin_order_detail(call: CallbackQuery):
     cid = call.message.chat.id
     if not _is_admin(cid): bot.answer_callback_query(call.id,"⛔️"); return
-    order_id = int(call.data.split("_")[2]); is_super = _is_superadmin(cid)
+    order_id = int(call.data.split("_")[1]); is_super = _is_superadmin(cid)
     bot.answer_callback_query(call.id)
     order = db_get_order_full(order_id)
     if not order: bot.send_message(cid,"❌ سفارش پیدا نشد."); return
@@ -1505,18 +1716,24 @@ def cb_admin_order_detail(call: CallbackQuery):
     if is_super:
         items_text = "\n".join(f"  • {i['model_name']} ×{i['quantity']} = {int(i['line_total']):,}" for i in order["items"])
         text = (f"📦 <b>سفارش #{order_id}</b>  |  {STATUS_FA.get(order['status'],'—')}\n"
-                f"👤 {user['name'] if user else '—'}  |  📅 {order['created_at'].strftime('%Y/%m/%d %H:%M')}\n"
-                f"تحویل: {order['delivery_date']}  |  پارچه: {order['fabric']}\n\n"
+                f"👤 {user['name'] if user else '—'}  |  📅 ثبت: {order['created_at'].strftime('%Y/%m/%d %H:%M')}\n"
+                f"🚚 تحویل: {order['delivery_date']}  |  🧵 پارچه: {order['fabric']}\n\n"
                 f"{items_text}\n\n💵 <b>{int(order['total_price']):,} تومان</b>")
     else:
         items = db_get_order_items_no_price(order_id)
         items_text = "\n".join(f"  • {i['model_name']} ×{i['quantity']}" for i in items)
         text = (f"📦 <b>سفارش #{order_id}</b>  |  {STATUS_FA.get(order['status'],'—')}\n"
-                f"👤 {user['name'] if user else '—'}  |  📅 {order['created_at'].strftime('%Y/%m/%d %H:%M')}\n"
-                f"تحویل: {order['delivery_date']}  |  پارچه: {order['fabric']}\n\n{items_text}")
-    if order.get("note"): text += f"\n📝 {order['note']}"
-    if order.get("rejection_reason"): text += f"\n❌ دلیل: {order['rejection_reason']}"
-    bot.send_message(cid, text, reply_markup=order_status_change_kb(order_id, is_super))
+                f"👤 {user['name'] if user else '—'}  |  📅 ثبت: {order['created_at'].strftime('%Y/%m/%d %H:%M')}\n"
+                f"🚚 تحویل: {order['delivery_date']}  |  🧵 پارچه: {order['fabric']}\n\n{items_text}")
+    if order.get("note"): text += f"\n📝 یادداشت: {order['note']}"
+    if order.get("rejection_reason"): text += f"\n❌ دلیل رد: {order['rejection_reason']}"
+    if order.get("history"):
+        text += "\n\n📜 <b>تاریخچه‌ی وضعیت:</b>"
+        for h in order["history"]:
+            ts = h["changed_at"].strftime("%m/%d %H:%M")
+            by = f" - {h['admin_name']}" if h.get("admin_name") else ""
+            text += f"\n  • {STATUS_FA.get(h['new_status'], h['new_status'])}  |  {ts}{by}"
+    bot.send_message(cid, text, reply_markup=order_status_change_kb(order_id, order["status"], is_super))
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("adm_st_"))
 @safe_handler
@@ -1524,11 +1741,16 @@ def cb_admin_set_status(call: CallbackQuery):
     cid = call.message.chat.id
     if not _is_admin(cid): bot.answer_callback_query(call.id,"⛔️"); return
     parts = call.data.split("_"); order_id = int(parts[2]); status = parts[3]
+    admin_id = _admin_db_id(cid)
     if status == "rejected":
         bot.answer_callback_query(call.id)
         msg = bot.send_message(cid, f"❌ دلیل رد سفارش #{order_id}:")
         bot.register_next_step_handler(msg, _admin_reject_reason, order_id); return
-    db_update_order_status(order_id, status)
+    if status == "cancelled":
+        bot.answer_callback_query(call.id)
+        msg = bot.send_message(cid, f"🚫 دلیل لغو سفارش #{order_id} (یا «-» برای رد کردن دلیل):")
+        bot.register_next_step_handler(msg, _admin_cancel_reason, order_id); return
+    db_update_order_status(order_id, status, admin_db_id=admin_id)
     bot.answer_callback_query(call.id, "✅ بروز شد.")
     bot.edit_message_reply_markup(cid, call.message.message_id, reply_markup=None)
     bot.send_message(cid, f"سفارش #{order_id} → {STATUS_FA.get(status,status)}")
@@ -1537,9 +1759,19 @@ def cb_admin_set_status(call: CallbackQuery):
 @safe_handler
 def _admin_reject_reason(message: Message, order_id: int):
     reason = message.text.strip()
-    db_update_order_status(order_id, "rejected", reason)
+    admin_id = _admin_db_id(message.chat.id)
+    db_update_order_status(order_id, "rejected", reason, admin_db_id=admin_id)
     bot.send_message(message.chat.id, f"✅ سفارش #{order_id} رد شد.")
     _notify_user_order_status(order_id, "rejected", reason)
+
+@safe_handler
+def _admin_cancel_reason(message: Message, order_id: int):
+    reason = message.text.strip()
+    reason = None if reason == "-" else reason
+    admin_id = _admin_db_id(message.chat.id)
+    db_cancel_order(order_id, admin_db_id=admin_id)
+    bot.send_message(message.chat.id, f"✅ سفارش #{order_id} لغو شد.")
+    _notify_user_order_status(order_id, "cancelled", reason)
 
 def _notify_user_order_status(order_id: int, status: str, reason: str = None):
     order = db_get_order_full(order_id)
@@ -1591,16 +1823,30 @@ def cb_pay_approve(call: CallbackQuery):
     if not result: bot.answer_callback_query(call.id,"⚠️ قبلاً پردازش شده."); return
     bot.answer_callback_query(call.id,"✅ تایید شد.")
     bot.edit_message_reply_markup(cid, call.message.message_id, reply_markup=None)
-    bot.send_message(cid, f"✅ پرداخت #{tx_id} تایید شد.\n"
-                     f"💵 {result['amount']:,}  |  ماه جاری:{result['paid_current']:,}  |  قبلی:{result['paid_previous']:,}\n"
-                     f"وضعیت: ماه جاری:{result['new_cmd']:,}  قبلی:{result['new_prev']:,}")
     user = db_get_user_by_db_id(result["user_db_id"])
-    if user:
-        try:
-            bot.send_message(user["cid"],
-                f"✅ <b>پرداخت {result['amount']:,} تومانی تایید شد!</b>\n"
-                f"📅 بدهی ماه جاری: {result['new_cmd']:,}\n💳 بدهی قبلی: {result['new_prev']:,}")
-        except: pass
+
+    if result.get("is_installment"):
+        bot.send_message(cid, f"✅ پرداخت قسط #{tx_id} تایید شد.\n"
+                         f"📋 قسط #{result['installment_id']}  |  💵 {result['amount']:,}\n"
+                         f"باقی‌مانده‌ی قسط: {result['installment_remaining']:,}\n"
+                         f"بدهی قبلی جدید: {result['new_prev']:,}")
+        if user:
+            try:
+                bot.send_message(user["cid"],
+                    f"✅ <b>پرداخت قسط {result['amount']:,} تومانی تایید شد!</b>\n"
+                    f"باقی‌مانده‌ی این قسط: {result['installment_remaining']:,}\n"
+                    f"💳 بدهی قبلی: {result['new_prev']:,}")
+            except: pass
+    else:
+        bot.send_message(cid, f"✅ پرداخت #{tx_id} تایید شد.\n"
+                         f"💵 {result['amount']:,}  |  ماه جاری:{result['paid_current']:,}  |  قبلی:{result['paid_previous']:,}\n"
+                         f"وضعیت: ماه جاری:{result['new_cmd']:,}  قبلی:{result['new_prev']:,}")
+        if user:
+            try:
+                bot.send_message(user["cid"],
+                    f"✅ <b>پرداخت {result['amount']:,} تومانی تایید شد!</b>\n"
+                    f"📅 بدهی ماه جاری: {result['new_cmd']:,}\n💳 بدهی قبلی: {result['new_prev']:,}")
+            except: pass
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("pay_no_"))
 @safe_handler
@@ -1858,8 +2104,22 @@ def cb_sa_inst(call: CallbackQuery):
     cid = call.message.chat.id
     if not _is_superadmin(cid): bot.answer_callback_query(call.id,"⛔️"); return
     uid = int(call.data.split("_")[2]); bot.answer_callback_query(call.id)
-    set_state(cid, S_SA_INST_AMOUNT, target_uid=uid)
-    msg = bot.send_message(cid,"📋 کل مبلغ قسط‌بندی (تومان):")
+    fin = db_get_user_finance(uid)
+    prev = int(fin["previous_debt"]) if fin else 0
+    already = db_get_active_installments_sum(uid)
+    available = prev - already
+    if available <= 0:
+        bot.send_message(cid,
+            f"⚠️ بدهی قبلی این کاربر <b>{prev:,}</b> تومانه که "
+            f"<b>{already:,}</b> تومانش از قبل قسط‌بندی شده.\n"
+            f"چیزی برای قسط‌بندی جدید آزاد نیست.")
+        return
+    set_state(cid, S_SA_INST_AMOUNT, target_uid=uid, inst_available=available)
+    msg = bot.send_message(cid,
+        f"📋 <b>قسط‌بندی جدید</b>\n"
+        f"💳 بدهی قبلی: {prev:,}  |  قبلاً قسط‌بندی شده: {already:,}\n"
+        f"✅ حداکثر قابل قسط‌بندی: <b>{available:,}</b> تومان\n\n"
+        f"کل مبلغ قسط‌بندی رو وارد کن:")
     bot.register_next_step_handler(msg,_sa_inst_amt)
 
 @safe_handler
@@ -1871,6 +2131,11 @@ def _sa_inst_amt(m: Message):
         if amount<=0: raise ValueError
     except ValueError:
         msg = bot.send_message(cid,"❌ عدد مثبت:"); bot.register_next_step_handler(msg,_sa_inst_amt); return
+    available = get_state(cid)["data"]["inst_available"]
+    if amount > available:
+        msg = bot.send_message(cid,
+            f"❌ این مبلغ از سقف قابل قسط‌بندی ({available:,} تومان) بیشتره.\nمجدد وارد کن:")
+        bot.register_next_step_handler(msg,_sa_inst_amt); return
     set_state(cid, S_SA_INST_COUNT, inst_total=amount)
     msg = bot.send_message(cid,"تعداد اقساط:"); bot.register_next_step_handler(msg,_sa_inst_count)
 
@@ -1903,8 +2168,13 @@ def _sa_inst_dates(m: Message):
             msg = bot.send_message(cid,f"❌ فرمت اشتباه: {l}")
             bot.register_next_step_handler(msg,_sa_inst_dates); return
     admin = db_get_admin(cid)
-    iid = db_add_installment(d["target_uid"], d["inst_total"], d["inst_count"], lines, admin["id"])
+    iid, err_available = db_add_installment(d["target_uid"], d["inst_total"], d["inst_count"], lines, admin["id"])
     clear_state(cid)
+    if iid is None:
+        bot.send_message(cid,
+            f"❌ مبلغ قسط‌بندی از سقف بدهی قبلیِ آزاد ({err_available:,} تومان) بیشتر شده "
+            f"(احتمالاً همزمان یه قسط‌بندی دیگه ثبت شده). دوباره از منوی کاربر امتحان کن.")
+        return
     bot.send_message(cid, f"✅ قسط‌بندی #{iid} ثبت شد.")
     user = db_get_user_by_db_id(d["target_uid"])
     if user:
@@ -1993,7 +2263,8 @@ def cb_mdl_deact(call: CallbackQuery):
     mid = int(call.data.split("_")[3]); db_deactivate_model(mid)
     bot.answer_callback_query(call.id,"🗑 غیرفعال شد.")
 
-@bot.callback_query_handler(func=lambda c: c.data.startswith("sa_mdl_del_"))
+@bot.callback_query_handler(func=lambda c: c.data.startswith("sa_mdl_del_") and
+    not c.data.startswith("sa_mdl_del_ok_"))
 @safe_handler
 def cb_mdl_del(call: CallbackQuery):
     cid = call.message.chat.id
