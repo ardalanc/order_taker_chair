@@ -41,6 +41,51 @@ bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML", exception_handler=GlobalExce
 
 PAGE_SIZE = 20
 
+# ════════════════════════════════════════════════════════════════
+#  تبدیل تاریخ میلادی ↔ شمسی
+# ════════════════════════════════════════════════════════════════
+
+def to_jalali(dt, fmt: str = "%Y/%m/%d") -> str:
+    """تبدیل datetime یا date میلادی (از دیتابیس) به رشته‌ی شمسی."""
+    if dt is None:
+        return "—"
+    try:
+        if hasattr(dt, 'hour'):   # datetime
+            return jdatetime.datetime.fromgregorian(datetime=dt).strftime(fmt)
+        else:                     # date
+            return jdatetime.date.fromgregorian(date=dt).strftime(fmt)
+    except Exception:
+        return str(dt)
+
+def to_jalali_full(dt) -> str:
+    """تاریخ و ساعت شمسی: ۱۴۰۳/۰۶/۱۵ ۱۴:۳۰"""
+    return to_jalali(dt, "%Y/%m/%d %H:%M")
+
+def jalali_to_gregorian(jalali_str: str) -> str:
+    """
+    تبدیل رشته‌ی شمسی (۱۴۰۳-۰۶-۱۵ یا ۱۴۰۳/۰۶/۱۵) به میلادی (YYYY-MM-DD)
+    برای ذخیره در دیتابیس.
+    """
+    s = jalali_str.strip().replace("/", "-")
+    parts = s.split("-")
+    y, m, d = int(parts[0]), int(parts[1]), int(parts[2])
+    g = jdatetime.date(y, m, d).togregorian()
+    return g.strftime("%Y-%m-%d")
+
+def validate_jalali(s: str) -> bool:
+    """چک می‌کنه تاریخ شمسی معتبره یا نه."""
+    try:
+        s = s.strip().replace("/", "-")
+        parts = s.split("-")
+        if len(parts) != 3:
+            return False
+        y, m, d = int(parts[0]), int(parts[1]), int(parts[2])
+        jdatetime.date(y, m, d)
+        return True
+    except Exception:
+        return False
+
+
 
 def safe_handler(func):
     """
@@ -823,7 +868,7 @@ def _format_order_summary(items, fabric, delivery_date, note, show_price=True) -
     if show_price:
         lines.append(f"\n💵 <b>جمع کل: {total:,} تومان</b>")
     lines.append(f"🪡 پارچه: {fabric}")
-    lines.append(f"📅 تاریخ تحویل: {delivery_date}")
+    lines.append(f"📅 تاریخ تحویل: {to_jalali(delivery_date) if hasattr(delivery_date, 'year') else delivery_date}")
     if note: lines.append(f"📝 یادداشت: {note}")
     return "\n".join(lines)
 
@@ -885,12 +930,16 @@ def qty_kb():
     return kb
 
 def date_kb():
-    kb = InlineKeyboardMarkup(row_width=1); today = datetime.now()
+    kb = InlineKeyboardMarkup(row_width=1)
+    today_g = datetime.now()
     for d in [2, 3, 4, 5, 6, 7]:
-        dt = today + timedelta(days=d)
-        kb.add(InlineKeyboardButton(f"{dt.strftime('%Y/%m/%d')} ({d} روز)",
-                                    callback_data=f"date_{dt.strftime('%Y-%m-%d')}"))
-    kb.add(InlineKeyboardButton("✏️ تاریخ دلخواه", callback_data="date_manual"))
+        dt_g = today_g + timedelta(days=d)
+        dt_j = jdatetime.date.fromgregorian(date=dt_g.date())
+        jalali_display  = dt_j.strftime("%Y/%m/%d")
+        gregorian_value = dt_g.strftime("%Y-%m-%d")
+        kb.add(InlineKeyboardButton(f"{jalali_display}  ({d} روز دیگه)",
+                                    callback_data=f"date_{gregorian_value}"))
+    kb.add(InlineKeyboardButton("✏️ تاریخ دلخواه (شمسی)", callback_data="date_manual"))
     return kb
 
 def order_confirm_kb():
@@ -1096,7 +1145,7 @@ def cb_user_orders(call: CallbackQuery):
     kb = InlineKeyboardMarkup(row_width=1)
     for o in orders:
         st_e = STATUS_EMOJI.get(o["status"], "•")
-        lbl  = f"{st_e} #{o['id']}  {o['created_at'].strftime('%m/%d')}"
+        lbl  = f"{st_e} #{o['id']}  {to_jalali(o['created_at'], '%m/%d')}"
         kb.add(InlineKeyboardButton(lbl, callback_data=f"uord_detail_{o['id']}"))
 
     pag = _paginate_kb(offset, total, f"uo_{status}_{offset-PAGE_SIZE}",
@@ -1131,14 +1180,14 @@ def cb_user_order_detail(call: CallbackQuery):
                                     order["delivery_date"], order.get("note",""))
     text = (f"📦 <b>سفارش #{order_id}</b>\n"
             f"وضعیت: {STATUS_FA.get(order['status'],'—')}\n"
-            f"تاریخ ثبت: {order['created_at'].strftime('%Y/%m/%d %H:%M')}\n\n"
+            f"تاریخ ثبت: {to_jalali_full(order['created_at'])}\n\n"
             f"{summary}")
     if order.get("rejection_reason"):
         text += f"\n\n❌ دلیل رد: {order['rejection_reason']}"
     if order.get("history"):
         text += "\n\n📜 <b>تاریخچه‌ی وضعیت:</b>"
         for h in order["history"]:
-            ts = h["changed_at"].strftime("%m/%d %H:%M")
+            ts = to_jalali_full(h["changed_at"])
             text += f"\n  • {STATUS_FA.get(h['new_status'], h['new_status'])}  |  {ts}"
 
     bot.send_message(cid, text, reply_markup=user_order_actions_kb(order_id, order["status"]))
@@ -1264,11 +1313,11 @@ def cb_edit_date(call: CallbackQuery):
 def _edit_recv_manual_date(message: Message):
     cid = message.chat.id
     if get_state(cid).get("step") != S_EDIT_DATE: return
-    try: datetime.strptime(message.text.strip(), "%Y-%m-%d")
-    except ValueError:
-        msg = bot.send_message(cid, "❌ فرمت: YYYY-MM-DD")
+    if not validate_jalali(message.text.strip()):
+        msg = bot.send_message(cid, "❌ تاریخ شمسی معتبر نیست. فرمت: ۱۴۰۳/۰۶/۱۵")
         bot.register_next_step_handler(msg, _edit_recv_manual_date); return
-    _edit_show_confirm(cid, message.text.strip())
+    gregorian = jalali_to_gregorian(message.text.strip())
+    _edit_show_confirm(cid, gregorian)
 
 def _edit_show_confirm(cid: int, delivery_date: str):
     set_state(cid, S_EDIT_CONFIRM, delivery_date=delivery_date)
@@ -1395,11 +1444,11 @@ def cb_date(call: CallbackQuery):
 def _recv_manual_date(message: Message):
     cid = message.chat.id
     if get_state(cid).get("step") != S_ENTER_DATE: return
-    try: datetime.strptime(message.text.strip(), "%Y-%m-%d")
-    except ValueError:
-        msg = bot.send_message(cid, "❌ فرمت: YYYY-MM-DD")
+    if not validate_jalali(message.text.strip()):
+        msg = bot.send_message(cid, "❌ تاریخ شمسی معتبر نیست. فرمت: ۱۴۰۳/۰۶/۱۵")
         bot.register_next_step_handler(msg, _recv_manual_date); return
-    _proceed_to_note(cid, message.text.strip())
+    gregorian = jalali_to_gregorian(message.text.strip())
+    _proceed_to_note(cid, gregorian)
 
 def _proceed_to_note(cid: int, delivery_date: str):
     set_state(cid, S_ENTER_NOTE, delivery_date=delivery_date)
@@ -1491,7 +1540,7 @@ def cb_fin_history(call: CallbackQuery):
     for tx in txs:
         tp = TYPE_FA.get(tx["type"], tx["type"])
         st = STATUS_T.get(tx.get("status"))
-        dt = tx["created_at"].strftime("%m/%d %H:%M")
+        dt = to_jalali_full(tx["created_at"])
         lines.append(f"• {tp} {st}  {int(tx['amount']):,}ت  |  {dt}")
 
     kb = InlineKeyboardMarkup(row_width=2)
@@ -1549,7 +1598,7 @@ def cb_fin_pending(call: CallbackQuery):
     if not pnd: bot.send_message(cid, "⏳ هیچ پرداختی در انتظار تایید ندارید."); return
     lines = ["⏳ <b>در انتظار تایید:</b>\n"]
     for p in pnd:
-        lines.append(f"• {int(p['amount']):,} تومان  |  {p['created_at'].strftime('%m/%d %H:%M')}")
+        lines.append(f"• {int(p['amount']):,} تومان  |  {to_jalali_full(p['created_at'])}")
     bot.send_message(cid, "\n".join(lines))
 
 @bot.callback_query_handler(func=lambda c: c.data == "fin_new_pay")
@@ -1687,7 +1736,7 @@ def cb_admin_orders(call: CallbackQuery):
     for o in orders:
         st_e = STATUS_EMOJI.get(o["status"],"•")
         price_part = f"  |  {int(o['total_price']):,}ت" if is_super and "total_price" in o else ""
-        delivery = o['delivery_date'].strftime('%m/%d') if o.get('delivery_date') else "—"
+        delivery = to_jalali(o['delivery_date'], '%m/%d') if o.get('delivery_date') else "—"
         lbl = f"{st_e} #{o['id']} {o['user_name']}  📅{delivery}{price_part}"
         kb.add(InlineKeyboardButton(lbl, callback_data=f"aodet_{o['id']}"))
 
@@ -1716,21 +1765,21 @@ def cb_admin_order_detail(call: CallbackQuery):
     if is_super:
         items_text = "\n".join(f"  • {i['model_name']} ×{i['quantity']} = {int(i['line_total']):,}" for i in order["items"])
         text = (f"📦 <b>سفارش #{order_id}</b>  |  {STATUS_FA.get(order['status'],'—')}\n"
-                f"👤 {user['name'] if user else '—'}  |  📅 ثبت: {order['created_at'].strftime('%Y/%m/%d %H:%M')}\n"
-                f"🚚 تحویل: {order['delivery_date']}  |  🧵 پارچه: {order['fabric']}\n\n"
+                f"👤 {user['name'] if user else '—'}  |  📅 ثبت: {to_jalali_full(order['created_at'])}\n"
+                f"🚚 تحویل: {to_jalali(order['delivery_date'])}  |  🧵 پارچه: {order['fabric']}\n\n"
                 f"{items_text}\n\n💵 <b>{int(order['total_price']):,} تومان</b>")
     else:
         items = db_get_order_items_no_price(order_id)
         items_text = "\n".join(f"  • {i['model_name']} ×{i['quantity']}" for i in items)
         text = (f"📦 <b>سفارش #{order_id}</b>  |  {STATUS_FA.get(order['status'],'—')}\n"
-                f"👤 {user['name'] if user else '—'}  |  📅 ثبت: {order['created_at'].strftime('%Y/%m/%d %H:%M')}\n"
-                f"🚚 تحویل: {order['delivery_date']}  |  🧵 پارچه: {order['fabric']}\n\n{items_text}")
+                f"👤 {user['name'] if user else '—'}  |  📅 ثبت: {to_jalali_full(order['created_at'])}\n"
+                f"🚚 تحویل: {to_jalali(order['delivery_date'])}  |  🧵 پارچه: {order['fabric']}\n\n{items_text}")
     if order.get("note"): text += f"\n📝 یادداشت: {order['note']}"
     if order.get("rejection_reason"): text += f"\n❌ دلیل رد: {order['rejection_reason']}"
     if order.get("history"):
         text += "\n\n📜 <b>تاریخچه‌ی وضعیت:</b>"
         for h in order["history"]:
-            ts = h["changed_at"].strftime("%m/%d %H:%M")
+            ts = to_jalali_full(h["changed_at"])
             by = f" - {h['admin_name']}" if h.get("admin_name") else ""
             text += f"\n  • {STATUS_FA.get(h['new_status'], h['new_status'])}  |  {ts}{by}"
     bot.send_message(cid, text, reply_markup=order_status_change_kb(order_id, order["status"], is_super))
@@ -1935,12 +1984,12 @@ def cb_sa_user_detail(call: CallbackQuery):
         text += f"\n📦 آخرین سفارشات:\n"
         for o in report["orders"][:5]:
             st = STATUS_EMOJI.get(o["status"],"•")
-            text += f"  {st} #{o['id']}  {int(o['total_price']):,}ت  {o['created_at'].strftime('%m/%d')}\n"
+            text += f"  {st} #{o['id']}  {int(o['total_price']):,}ت  {to_jalali(o['created_at'], '%m/%d')}\n"
     if report["transactions"]:
         text += f"\n💳 آخرین تراکنش‌ها:\n"
         for tx in report["transactions"][:5]:
             tp = TYPE_FA.get(tx["type"],"•")
-            text += f"  {tp} {int(tx['amount']):,}ت  {tx['created_at'].strftime('%m/%d')}\n"
+            text += f"  {tp} {int(tx['amount']):,}ت  {to_jalali(tx['created_at'], '%m/%d')}\n"
     bot.send_message(cid, text, reply_markup=sa_user_actions_kb(uid, u["is_banned"]))
 
 @bot.callback_query_handler(func=lambda c: c.data == "sa_add_user")
@@ -2163,10 +2212,11 @@ def _sa_inst_dates(m: Message):
         msg = bot.send_message(cid,f"❌ باید {d['inst_count']} تاریخ باشه:")
         bot.register_next_step_handler(msg,_sa_inst_dates); return
     for l in lines:
-        try: datetime.strptime(l, "%Y-%m-%d")
-        except:
-            msg = bot.send_message(cid,f"❌ فرمت اشتباه: {l}")
-            bot.register_next_step_handler(msg,_sa_inst_dates); return
+        if not validate_jalali(l):
+            msg = bot.send_message(cid, f"❌ تاریخ شمسی معتبر نیست: {l}\nفرمت: ۱۴۰۳/۰۶/۱۵")
+            bot.register_next_step_handler(msg, _sa_inst_dates); return
+    # تبدیل همه به میلادی برای ذخیره در دیتابیس
+    lines = [jalali_to_gregorian(l) for l in lines]
     admin = db_get_admin(cid)
     iid, err_available = db_add_installment(d["target_uid"], d["inst_total"], d["inst_count"], lines, admin["id"])
     clear_state(cid)
@@ -2217,7 +2267,7 @@ def cb_sa_mdl_detail(call: CallbackQuery):
         SELECT mp.price, mp.set_at, a.name AS aname FROM model_prices mp
         LEFT JOIN admins a ON a.id=mp.set_by WHERE mp.model_id=%s ORDER BY mp.set_at DESC LIMIT 5
     """, (mid,)); hist = cur.fetchall(); cur.close(); conn.close()
-    hist_text = "\n".join(f"  • {int(p['price']):,}  {p['set_at'].strftime('%Y/%m/%d')}  {p['aname'] or '—'}" for p in hist)
+    hist_text = "\n".join(f"  • {int(p['price']):,}  {to_jalali(p['set_at'])}  {p['aname'] or '—'}" for p in hist)
     bot.send_message(cid,
         f"📦 <b>{model['name']}</b>  |  {'✅ فعال' if model['is_active'] else '❌ غیرفعال'}\n"
         f"قیمت فعلی: <b>{int(model['price']):,}</b>\n\n📜 تاریخچه:\n{hist_text or '—'}",
