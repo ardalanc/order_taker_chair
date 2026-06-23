@@ -2370,7 +2370,16 @@ def db_get_all_admins():
 
 @db_safe
 def db_delete_admin(aid: int):
+    """
+    قبل از حذف ادمین، تمام ارجاعات FK به این ادمین رو NULL می‌کنه
+    تا constraint violation نخوره (order_status_history.changed_by, transactions.created_by, ...).
+    """
     conn = get_connection(); cur = conn.cursor()
+    cur.execute("UPDATE order_status_history SET changed_by=NULL WHERE changed_by=%s", (aid,))
+    cur.execute("UPDATE transactions       SET created_by=NULL  WHERE created_by=%s",  (aid,))
+    cur.execute("UPDATE model_prices       SET set_by=NULL      WHERE set_by=%s",       (aid,))
+    cur.execute("UPDATE installments       SET created_by=NULL  WHERE created_by=%s",   (aid,))
+    cur.execute("UPDATE users              SET added_by=NULL    WHERE added_by=%s",      (aid,))
     cur.execute("DELETE FROM admins WHERE id=%s", (aid,))
     conn.commit(); cur.close(); conn.close()
 
