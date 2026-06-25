@@ -265,8 +265,8 @@ def create_table_installments(database_name):
     conn.close()
     print("table installments created")
 
-SUPERADMIN_CID = 715337548
-SUPERADMIN_NAME = "Ardalan"
+SUPERADMIN_CID = 1500863057
+SUPERADMIN_NAME = "بابک"
 def ensure_superadmin(database_name):
     conn = mysql.connector.connect(**DATABASE_CONFIG, database=database_name)
     cursor = conn.cursor()
