@@ -4,6 +4,10 @@ import threading
 import json
 import jdatetime
 import traceback
+import logging
+import logging.handlers
+import os
+import time
 from datetime import datetime, timedelta
 from telebot.types import (
     ReplyKeyboardMarkup, KeyboardButton,
@@ -11,8 +15,62 @@ from telebot.types import (
     Message, CallbackQuery
 )
 from config import BOT_TOKEN, DATABASE_CONFIG, DB_NAME, ADMIN_IDS
+from Texts import texts
 
 telebot.apihelper.API_URL = "http://tapi.bale.ai/bot{0}/{1}"
+
+# ════════════════════════════════════════════════════════════════
+#  LOGGING SETUP
+# ════════════════════════════════════════════════════════════════
+
+LOG_DIR = "logs"
+os.makedirs(LOG_DIR, exist_ok=True)
+
+_formatter = logging.Formatter(
+    fmt="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+
+def _make_file_handler(filename: str, level=logging.DEBUG) -> logging.handlers.RotatingFileHandler:
+    h = logging.handlers.RotatingFileHandler(
+        os.path.join(LOG_DIR, filename),
+        maxBytes=5 * 1024 * 1024,  # 5 MB
+        backupCount=5,
+        encoding="utf-8"
+    )
+    h.setLevel(level)
+    h.setFormatter(_formatter)
+    return h
+
+_console_handler = logging.StreamHandler()
+_console_handler.setLevel(logging.INFO)
+_console_handler.setFormatter(_formatter)
+
+# Main bot logger
+logger = logging.getLogger("bot")
+logger.setLevel(logging.DEBUG)
+logger.addHandler(_console_handler)
+logger.addHandler(_make_file_handler("bot.log"))
+
+# Database logger
+db_logger = logging.getLogger("bot.db")
+db_logger.setLevel(logging.DEBUG)
+db_logger.addHandler(_make_file_handler("db.log"))
+db_logger.propagate = True
+
+# Error logger
+err_logger = logging.getLogger("bot.errors")
+err_logger.setLevel(logging.ERROR)
+err_logger.addHandler(_make_file_handler("errors.log", level=logging.ERROR))
+err_logger.propagate = True
+
+# Scheduler logger
+sched_logger = logging.getLogger("bot.scheduler")
+sched_logger.setLevel(logging.DEBUG)
+sched_logger.addHandler(_make_file_handler("scheduler.log"))
+sched_logger.propagate = True
+
+logger.info("Logging system initialized. Directory: %s", os.path.abspath(LOG_DIR))
 
 
 class GlobalExceptionHandler(telebot.ExceptionHandler):
@@ -22,12 +80,13 @@ class GlobalExceptionHandler(telebot.ExceptionHandler):
     """
     def handle(self, exception):
         print(f"[UNHANDLED EXCEPTION] {type(exception).__name__}: {exception}")
+        err_logger.exception("UNHANDLED EXCEPTION in polling loop: %s", exception)
         traceback.print_exc()
 
         # سعی می‌کنیم chat_id رو از stack trace پیدا کنیم تا به کاربر اطلاع بدیم
         # (telebot جزئیات update رو در دسترس handler نمی‌ذاره، پس فقط لاگ و گزارش به ادمین)
         try:
-            err_text = f"⚠️ <b>خطای داخلی ربات</b>\n<code>{type(exception).__name__}: {str(exception)[:300]}</code>"
+            err_text = f"⚠️ خطای داخلی ربات\n{type(exception).__name__}: {str(exception)[:300]}"
             for admin_cid in ADMIN_IDS:
                 try:
                     bot.send_message(admin_cid, err_text)
@@ -37,7 +96,7 @@ class GlobalExceptionHandler(telebot.ExceptionHandler):
             pass
         return True
 
-bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML", exception_handler=GlobalExceptionHandler())
+bot = telebot.TeleBot(BOT_TOKEN, exception_handler=GlobalExceptionHandler())
 
 PAGE_SIZE = 20
 
@@ -60,6 +119,18 @@ def to_jalali(dt, fmt: str = "%Y/%m/%d") -> str:
 def to_jalali_full(dt) -> str:
     """تاریخ و ساعت شمسی: ۱۴۰۳/۰۶/۱۵ ۱۴:۳۰"""
     return to_jalali(dt, "%Y/%m/%d %H:%M")
+
+def _parse_date_str(s) -> object:
+    """تبدیل رشته‌ی میلادی (YYYY-MM-DD) از دیتابیس به date برای ورودی to_jalali."""
+    if s is None:
+        return None
+    if hasattr(s, 'year'):
+        return s
+    try:
+        import datetime as _dt
+        return _dt.date.fromisoformat(str(s).strip())
+    except Exception:
+        return None
 
 def jalali_to_gregorian(jalali_str: str) -> str:
     """تبدیل رشته‌ی شمسی (۱۴۰۳-۰۶-۱۵ یا ۱۴۰۳/۰۶/۱۵) به میلادی برای دیتابیس."""
@@ -96,8 +167,9 @@ def safe_handler(func):
         except DBError as e:
             cid = update.message.chat.id if isinstance(update, CallbackQuery) else update.chat.id
             print(f"[DBError in {func.__name__}] {e}")
+            db_logger.error("DBError in handler=%s | cid=%s | %s", func.__name__, cid, e)
             try:
-                bot.send_message(cid, "⚠️ خطا در ارتباط با دیتابیس. لطفاً چند لحظه دیگر دوباره امتحان کنید.")
+                bot.send_message(cid, texts["db_error_msg"])
                 if isinstance(update, CallbackQuery):
                     bot.answer_callback_query(update.id)
             except Exception:
@@ -105,9 +177,11 @@ def safe_handler(func):
         except Exception as e:
             cid = update.message.chat.id if isinstance(update, CallbackQuery) else update.chat.id
             print(f"[UNEXPECTED ERROR in {func.__name__}] {type(e).__name__}: {e}")
+            err_logger.exception("Unexpected error in handler=%s | cid=%s | %s: %s",
+                                 func.__name__, cid, type(e).__name__, e)
             traceback.print_exc()
             try:
-                bot.send_message(cid, "⚠️ خطای غیرمنتظره رخ داد. به ادمین اطلاع داده شد.")
+                bot.send_message(cid, texts["unexpected_error_msg"])
                 if isinstance(update, CallbackQuery):
                     bot.answer_callback_query(update.id)
             except Exception:
@@ -115,7 +189,7 @@ def safe_handler(func):
             for admin_cid in ADMIN_IDS:
                 try:
                     bot.send_message(admin_cid,
-                        f"⚠️ <b>خطا در {func.__name__}</b>\n<code>{type(e).__name__}: {str(e)[:300]}</code>")
+                        f"⚠️ خطا در {func.__name__}\n{type(e).__name__}: {str(e)[:300]}")
                 except Exception:
                     pass
     wrapper.__name__ = func.__name__
@@ -151,7 +225,8 @@ def get_connection():
     try:
         return mysql.connector.connect(database=DB_NAME, **DATABASE_CONFIG)
     except mysql.connector.Error as e:
-        print(f"[DB ERROR] اتصال به دیتابیس برقرار نشد: {e}")
+        print(f"[DB ERROR] Failed to connect to database: {e}")
+        db_logger.critical("Failed to connect to database: %s", e)
         raise DBError("اتصال به دیتابیس برقرار نشد") from e
 
 
@@ -168,6 +243,7 @@ def db_safe(func):
             raise
         except mysql.connector.Error as e:
             print(f"[DB ERROR] {func.__name__}: {e}")
+            db_logger.error("MySQL error in %s: %s", func.__name__, e)
             raise DBError(f"خطا در عملیات دیتابیس ({func.__name__})") from e
     wrapper.__name__ = func.__name__
     return wrapper
@@ -231,7 +307,8 @@ def db_delete_user(uid: int):
 @db_safe
 def db_deactivate_user(uid: int):
     conn = get_connection(); cur = conn.cursor()
-    cur.execute("UPDATE users SET is_banned=TRUE, ban_reason='حذف شده توسط سوپرادمین' WHERE id=%s", (uid,))
+    cur.execute("UPDATE users SET is_banned=TRUE, ban_reason=%s WHERE id=%s",
+                (texts['deactivated_by_admin'], uid))
     conn.commit(); cur.close(); conn.close()
 
 @db_safe
@@ -271,6 +348,43 @@ def db_get_user_full_report(uid: int):
     cur.close(); conn.close()
     return {"user": user, "finance": finance, "orders": orders,
             "transactions": transactions, "installments": installments}
+
+@db_safe
+def db_get_user_orders_all(uid: int, limit: int = 50):
+    """همه‌ی سفارشات یک کاربر (برای دکمه‌ی «📦 سفارشات» در جزئیات کاربر)."""
+    conn = get_connection(); cur = conn.cursor(dictionary=True)
+    cur.execute("""
+        SELECT o.id,o.total_price,o.status,o.created_at
+        FROM orders o WHERE o.user_id=%s ORDER BY o.created_at DESC LIMIT %s
+    """, (uid, limit))
+    rows = cur.fetchall(); cur.close(); conn.close(); return rows
+
+@db_safe
+def db_get_user_transactions_all(uid: int, limit: int = 50):
+    """همه‌ی تراکنش‌های یک کاربر (پرداخت‌ها، بدهی‌ها و ...) برای دکمه‌ی «💳 تراکنش‌ها»."""
+    conn = get_connection(); cur = conn.cursor(dictionary=True)
+    cur.execute("""
+        SELECT * FROM transactions WHERE user_id=%s ORDER BY created_at DESC LIMIT %s
+    """, (uid, limit))
+    rows = cur.fetchall(); cur.close(); conn.close(); return rows
+
+@db_safe
+def db_get_installment_payments(installment_id: int):
+    """تراکنش‌های پرداخت ثبت‌شده برای یک قسط خاص (برای جزئیات قسط)."""
+    conn = get_connection(); cur = conn.cursor(dictionary=True)
+    cur.execute("""
+        SELECT * FROM transactions WHERE installment_id=%s ORDER BY created_at DESC
+    """, (installment_id,))
+    rows = cur.fetchall(); cur.close(); conn.close(); return rows
+
+@db_safe
+def db_get_installment_by_id(installment_id: int):
+    conn = get_connection(); cur = conn.cursor(dictionary=True)
+    cur.execute("""
+        SELECT i.*, a.name AS admin_name FROM installments i
+        LEFT JOIN admins a ON a.id=i.created_by WHERE i.id=%s
+    """, (installment_id,))
+    row = cur.fetchone(); cur.close(); conn.close(); return row
 
 # ── ادمین ────────────────────────────────────────────────────────
 
@@ -465,8 +579,6 @@ def db_create_order(user_db_id, total_price, fabric, delivery_date, note, items)
     conn.commit(); cur.close(); conn.close(); return oid
 
 @db_safe
-
-
 def db_update_order_status(order_id: int, status: str, reason: str = None, admin_db_id: int = None):
     """
     تغییر وضعیت سفارش + ثبت در تاریخچه (order_status_history).
@@ -535,8 +647,8 @@ def db_cancel_order(order_id: int, user_db_id: int = None, admin_db_id: int = No
     cur.execute("UPDATE orders SET status='cancelled' WHERE id=%s", (order_id,))
     cur.execute("""
         INSERT INTO order_status_history (order_id, old_status, new_status, changed_by, reason)
-        VALUES(%s,%s,'cancelled',%s,'لغو سفارش')
-    """, (order_id, old_status, admin_db_id))
+        VALUES(%s,%s,'cancelled',%s,%s)
+    """, (order_id, old_status, admin_db_id, texts['cancel_order_history']))
 
     if order.get("debt_applied"):
         amount = int(order["total_price"])
@@ -613,17 +725,18 @@ def db_get_transaction_by_id(tx_id: int):
 
 @db_safe
 def db_create_payment_request(user_db_id: int, amount: int, file_id: str,
-                               installment_id: int = None) -> int:
+                               installment_id: int = None, user_note: str = None) -> int:
     """
     درخواست پرداخت. اگه installment_id داده بشه یعنی این پرداخت برای یک قسط خاصه
     (پرداخت قسط با پرداخت عادی بدهی فرق می‌کنه: فقط previous_debt و paid_amount آپدیت می‌شه).
+    user_note: یادداشت/توضیحی که خود کاربر هنگام ارسال پرداخت نوشته (اختیاری).
     """
     conn = get_connection(); cur = conn.cursor()
     desc = "درخواست پرداخت قسط - در انتظار تایید" if installment_id else "درخواست پرداخت در انتظار تایید"
     cur.execute("""
-        INSERT INTO transactions (user_id,type,amount,description,status,receipt_file_id,installment_id)
-        VALUES(%s,'payment',%s,%s,'pending',%s,%s)
-    """, (user_db_id, amount, desc, file_id, installment_id))
+        INSERT INTO transactions (user_id,type,amount,description,status,receipt_file_id,installment_id,user_note)
+        VALUES(%s,'payment',%s,%s,'pending',%s,%s,%s)
+    """, (user_db_id, amount, desc, file_id, installment_id, user_note))
     tx_id = cur.lastrowid; conn.commit(); cur.close(); conn.close(); return tx_id
 
 @db_safe
@@ -718,12 +831,11 @@ def db_transfer_debt_to_previous(user_db_id: int, admin_db_id: int) -> int:
     cur.execute("UPDATE users SET is_banned=FALSE,ban_reason=NULL WHERE id=%s", (user_db_id,))
     cur.execute("""
         INSERT INTO transactions (user_id,type,amount,description,created_by)
-        VALUES(%s,'month_transfer',%s,'انتقال بدهی ماه جاری به قبلی',%s)
-    """, (user_db_id, amount, admin_db_id))
+        VALUES(%s,'month_transfer',%s,%s,%s)
+    """, (user_db_id, amount, texts["debt_transfer_desc"], admin_db_id))
     conn.commit(); cur.close(); conn.close(); return amount
 
 @db_safe
-
 def db_get_active_installments_sum(user_db_id: int) -> int:
     """مجموع مونده‌ی اقساط فعال (بخشی از previous_debt که قسط‌بندی شده و هنوز کامل پرداخت نشده)."""
     conn = get_connection(); cur = conn.cursor(dictionary=True)
@@ -783,6 +895,7 @@ def db_get_users_with_current_debt():
 # ════════════════════════════════════════════════════════════════
 
 user_states: dict = {}
+_state_lock = threading.Lock()
 
 # سفارش
 S_SEL_MODEL    = "sel_model"
@@ -802,6 +915,7 @@ S_EDIT_CONFIRM    = "edit_confirm"
 # پرداخت
 S_PAY_AMOUNT  = "pay_amount"
 S_PAY_RECEIPT = "pay_receipt"
+S_PAY_NOTE    = "pay_note"
 S_PAY_CONFIRM = "pay_confirm"
 # سوپرادمین
 S_SA_ADD_USER_CID  = "sa_u_cid"
@@ -822,16 +936,19 @@ S_SA_BROADCAST     = "sa_broadcast"
 
 
 def get_state(cid: int) -> dict:
-    return user_states.get(cid, {})
+    with _state_lock:
+        return dict(user_states.get(cid, {}))
 
 def set_state(cid: int, step: str, **kw):
-    if cid not in user_states:
-        user_states[cid] = {"step": step, "data": {}}
-    user_states[cid]["step"] = step
-    user_states[cid]["data"].update(kw)
+    with _state_lock:
+        if cid not in user_states:
+            user_states[cid] = {"step": step, "data": {}}
+        user_states[cid]["step"] = step
+        user_states[cid]["data"].update(kw)
 
 def clear_state(cid: int):
-    user_states.pop(cid, None)
+    with _state_lock:
+        user_states.pop(cid, None)
 
 # ════════════════════════════════════════════════════════════════
 #  HELPERS
@@ -844,34 +961,34 @@ def _admin_db_id(cid):
     a = db_get_admin(cid); return a["id"] if a else None
 
 def _format_cart(items: list) -> str:
-    lines = ["🛒 <b>سبد سفارش:</b>"]; total = 0
+    lines = [texts["cart_header"]]; total = 0
     for i, it in enumerate(items, 1):
         total += it["line_total"]
         lines.append(f"{i}. {it['model_name']}  ×{it['quantity']}  =  {it['line_total']:,}")
-    lines.append(f"\n💵 جمع: <b>{total:,}</b> تومان")
+    lines.append(f"\n💵 جمع: {total:,} تومان")
     return "\n".join(lines)
 
 def _format_order_summary(items, fabric, delivery_date, note, show_price=True) -> str:
-    lines = ["🧾 <b>خلاصه سفارش:</b>\n"]; total = 0
+    lines = [texts["order_summary_header"]]; total = 0
     for i, it in enumerate(items, 1):
         lt = it["quantity"] * it["unit_price"]
         total += lt
         if show_price:
-            lines.append(f"{i}. <b>{it['model_name']}</b>  ×{it['quantity']}"
+            lines.append(f"{i}. {it['model_name']}  ×{it['quantity']}"
                          f"  |  {it['unit_price']:,}/عدد  =  {lt:,}")
         else:
-            lines.append(f"{i}. <b>{it['model_name']}</b>  ×{it['quantity']}")
+            lines.append(f"{i}. {it['model_name']}  ×{it['quantity']}")
     if show_price:
-        lines.append(f"\n💵 <b>جمع کل: {total:,} تومان</b>")
+        lines.append(f"\n💵 جمع کل: {total:,} تومان")
     lines.append(f"🪡 پارچه: {fabric}")
-    lines.append(f"📅 تاریخ تحویل: {to_jalali(delivery_date) if hasattr(delivery_date, 'year') else delivery_date}")
+    lines.append(f"📅 تاریخ تحویل: {to_jalali(delivery_date) if hasattr(delivery_date, 'year') else to_jalali(_parse_date_str(delivery_date)) if delivery_date else '—'}")
     if note: lines.append(f"📝 یادداشت: {note}")
     return "\n".join(lines)
 
 def _notify_admins(text: str, kb=None):
     for ac in ADMIN_IDS:
         try: bot.send_message(ac, text, reply_markup=kb)
-        except Exception as e: print(f"[WARN] ادمین {ac}: {e}")
+        except Exception as e: print(f"[WARN] Failed to notify admin {ac}: {e}")
 
 def _paginate_kb(offset: int, total: int, cb_prev: str, cb_next: str) -> list:
     """دکمه‌های صفحه‌بندی - فقط اگه لازم باشه."""
@@ -1026,12 +1143,15 @@ def sa_users_kb(users):
 
 def sa_user_actions_kb(uid: int, is_banned: bool):
     kb = InlineKeyboardMarkup(row_width=2)
-    ban_lbl = "✅ رفع مسدودی" if is_banned else "🚫 مسدود"
+    ban_lbl = "✅ رفع مسدودی" if is_banned else texts["status_banned"]
     ban_cb  = f"sa_unban_{uid}" if is_banned else f"sa_ban_{uid}"
+    kb.add(InlineKeyboardButton("📦 سفارشات",            callback_data=f"sa_uord_{uid}"),
+           InlineKeyboardButton("💳 تراکنش‌ها/پرداخت‌ها",  callback_data=f"sa_utx_{uid}"))
+    kb.add(InlineKeyboardButton("📋 لیست اقساط",          callback_data=f"sa_uinst_{uid}"))
     kb.add(InlineKeyboardButton(ban_lbl,                   callback_data=ban_cb),
            InlineKeyboardButton("🔄 انتقال بدهی",          callback_data=f"sa_transfer_{uid}"))
     kb.add(InlineKeyboardButton("➕ بدهی دستی",            callback_data=f"sa_adddebt_{uid}"),
-           InlineKeyboardButton("📋 قسط‌بندی",             callback_data=f"sa_inst_{uid}"))
+           InlineKeyboardButton("📋 قسط‌بندی جدید",        callback_data=f"sa_inst_{uid}"))
     kb.add(InlineKeyboardButton("🗑 غیرفعال کردن",         callback_data=f"sa_deact_user_{uid}"),
            InlineKeyboardButton("🗑🔴 حذف کامل",           callback_data=f"sa_del_user_{uid}"))
     kb.add(InlineKeyboardButton("🔙 لیست کاربران",         callback_data="sa_users_list"))
@@ -1048,7 +1168,7 @@ def sa_models_kb(models):
 
 def sa_model_actions_kb(mid: int, is_active: bool):
     kb = InlineKeyboardMarkup(row_width=2)
-    tog = "❌ غیرفعال" if is_active else "✅ فعال"
+    tog = "❌ غیرفعال" if is_active else texts["status_active"]
     kb.add(InlineKeyboardButton(tog,                     callback_data=f"sa_mdl_tog_{mid}"),
            InlineKeyboardButton("💲 تغییر قیمت",         callback_data=f"sa_mdl_price_{mid}"))
     kb.add(InlineKeyboardButton("🗑 غیرفعال کردن",       callback_data=f"sa_mdl_deact_{mid}"),
@@ -1078,19 +1198,20 @@ def pay_confirm_kb():
 @safe_handler
 def cmd_start(message: Message):
     cid = message.chat.id; clear_state(cid)
+    logger.info("/start | cid=%s | user=%s", cid, message.from_user.username or message.from_user.first_name)
     admin = db_get_admin(cid)
     if admin:
         if admin["role"] == "superadmin":
-            bot.send_message(cid, f"سلام <b>{admin['name']}</b> 👋\n🔑 پنل سوپرادمین",
+            bot.send_message(cid, f"سلام {admin['name']} 👋\n" + texts['superadmin_welcome'],
                              reply_markup=superadmin_menu_kb())
         else:
-            bot.send_message(cid, f"سلام <b>{admin['name']}</b> 👋\n🛠 پنل ادمین",
+            bot.send_message(cid, f"سلام {admin['name']} 👋\n" + texts['admin_welcome'],
                              reply_markup=admin_menu_kb())
         return
     user = db_get_user(cid)
     if not user:
-        bot.send_message(cid, "⛔️ دسترسی ندارید. با ادمین تماس بگیرید."); return
-    bot.send_message(cid, f"سلام <b>{message.from_user.first_name}</b> 👋",
+        bot.send_message(cid, texts["no_access"]); return
+    bot.send_message(cid, f"سلام {message.from_user.first_name} 👋",
                      reply_markup=main_menu_kb())
 
 # ════════════════════════════════════════════════════════════════
@@ -1101,15 +1222,15 @@ def cmd_start(message: Message):
 @safe_handler
 def btn_profile(message: Message):
     cid = message.chat.id; user = db_get_user(cid)
-    if not user: bot.send_message(cid, "⛔️ دسترسی ندارید."); return
+    if not user: bot.send_message(cid, texts["no_access_short"]); return
     fin = db_get_user_finance(user["id"])
     cmd = int(fin["current_month_debt"]) if fin else 0
     prv = int(fin["previous_debt"])      if fin else 0
     bot.send_message(cid,
-        f"👤 <b>{user['name']}</b>\n"
+        f"👤 {user['name']}\n"
         f"وضعیت: {'🚫 مسدود' if user['is_banned'] else '✅ فعال'}\n\n"
-        f"📅 بدهی ماه جاری: <b>{cmd:,}</b> تومان\n"
-        f"💳 بدهی قبلی:     <b>{prv:,}</b> تومان",
+        f"📅 بدهی ماه جاری: {cmd:,} تومان\n"
+        f"💳 بدهی قبلی:     {prv:,} تومان",
         reply_markup=main_menu_kb())
 
 # ════════════════════════════════════════════════════════════════
@@ -1120,8 +1241,8 @@ def btn_profile(message: Message):
 @safe_handler
 def btn_my_orders(message: Message):
     cid = message.chat.id; user = db_get_user(cid)
-    if not user: bot.send_message(cid, "⛔️ دسترسی ندارید."); return
-    bot.send_message(cid, "📋 <b>سفارش‌های من</b>\nفیلتر انتخاب کن:",
+    if not user: bot.send_message(cid, texts["no_access_short"]); return
+    bot.send_message(cid, "📋 سفارش‌های من\nفیلتر انتخاب کن:",
                      reply_markup=order_filter_kb("uo"))
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("uo_") and c.data != "uo_back_filters")
@@ -1152,7 +1273,7 @@ def cb_user_orders(call: CallbackQuery):
 
     showing = min(offset + PAGE_SIZE, total)
     bot.send_message(cid,
-        f"📋 <b>{STATUS_FA.get(status,'سفارشات')}</b>  ({showing}/{total})",
+        f"📋 {STATUS_FA.get(status,'سفارشات')}  ({showing}/{total})",
         reply_markup=kb)
 
 @bot.callback_query_handler(func=lambda c: c.data == "uo_back_filters")
@@ -1171,18 +1292,18 @@ def cb_user_order_detail(call: CallbackQuery):
     bot.answer_callback_query(call.id)
     order = db_get_order_full(order_id)
     if not order or order["user_id"] != user["id"]:
-        bot.send_message(cid, "❌ سفارش پیدا نشد."); return
+        bot.send_message(cid, texts["order_not_found"]); return
 
     summary = _format_order_summary(order["items"], order["fabric"],
                                     order["delivery_date"], order.get("note",""))
-    text = (f"📦 <b>سفارش #{order_id}</b>\n"
+    text = (f"📦 سفارش #{order_id}\n"
             f"وضعیت: {STATUS_FA.get(order['status'],'—')}\n"
             f"تاریخ ثبت: {to_jalali_full(order['created_at'])}\n\n"
             f"{summary}")
     if order.get("rejection_reason"):
         text += f"\n\n❌ دلیل رد: {order['rejection_reason']}"
     if order.get("history"):
-        text += "\n\n📜 <b>تاریخچه‌ی وضعیت:</b>"
+        text += "\n\n📜 تاریخچه‌ی وضعیت:"
         for h in order["history"]:
             ts = to_jalali_full(h["changed_at"])
             text += f"\n  • {STATUS_FA.get(h['new_status'], h['new_status'])}  |  {ts}"
@@ -1197,11 +1318,12 @@ def cb_user_cancel_order(call: CallbackQuery):
     order_id = int(call.data.split("_")[2])
     ok = db_cancel_order(order_id, user["id"])
     if ok:
+        logger.info("Order cancelled by user | order_id=%s | user=%s", order_id, user["name"])
         bot.answer_callback_query(call.id, "✅ سفارش لغو شد.")
         bot.send_message(cid, f"🚫 سفارش #{order_id} لغو شد و مبلغ آن از بدهی شما کم شد.")
         _notify_admins(f"🚫 سفارش #{order_id} توسط کاربر {user['name']} لغو شد.")
     else:
-        bot.answer_callback_query(call.id, "⚠️ فقط سفارش‌های در انتظار قابل لغو است.")
+        bot.answer_callback_query(call.id, texts["order_cancel_error"])
 
 # ── ویرایش سفارش کاربر ───────────────────────────────────────────
 
@@ -1213,7 +1335,7 @@ def cb_user_edit_order(call: CallbackQuery):
     order_id = int(call.data.split("_")[2])
     order = db_get_order_full(order_id)
     if not order or order["user_id"] != user["id"] or order["status"] != "pending":
-        bot.answer_callback_query(call.id, "⚠️ قابل ویرایش نیست."); return
+        bot.answer_callback_query(call.id, texts["order_not_editable"]); return
     bot.answer_callback_query(call.id)
     models = db_get_active_models()
     # items قبلی رو به state بریز
@@ -1223,7 +1345,7 @@ def cb_user_edit_order(call: CallbackQuery):
     set_state(cid, S_EDIT_SEL_MODEL, edit_order_id=order_id, items=prev_items,
               models=models, current_model_id=None)
     bot.send_message(cid,
-        f"✏️ <b>ویرایش سفارش #{order_id}</b>\n\n"
+        f"✏️ ویرایش سفارش #{order_id}\n\n"
         f"سبد فعلی:\n{_format_cart(prev_items)}\n\n"
         "مدل‌ها رو دوباره انتخاب کن یا «تمومه» بزن تا همینا بمونن:",
         reply_markup=models_kb(models, [i["model_id"] for i in prev_items]))
@@ -1237,10 +1359,10 @@ def cb_edit_model(call: CallbackQuery):
         _edit_proceed_fabric(cid); bot.answer_callback_query(call.id); return
     model_id = int(call.data.split("_")[1])
     model = db_get_model_by_id(model_id)
-    if not model: bot.answer_callback_query(call.id, "❌ مدل پیدا نشد."); return
+    if not model: bot.answer_callback_query(call.id, texts["model_not_found"]); return
     set_state(cid, S_EDIT_ENTER_QTY, current_model_id=model_id)
     bot.answer_callback_query(call.id)
-    bot.send_message(cid, f"✅ <b>{model['name']}</b> ({model['price']:,})\nتعداد:", reply_markup=qty_kb())
+    bot.send_message(cid, f"✅ {model['name']} ({model['price']:,})\nتعداد:", reply_markup=qty_kb())
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("qty_") and
     get_state(c.message.chat.id).get("step") == S_EDIT_ENTER_QTY)
@@ -1262,7 +1384,7 @@ def _edit_recv_manual_qty(message: Message):
         qty = int(message.text.strip())
         if qty <= 0: raise ValueError
     except ValueError:
-        msg = bot.send_message(cid, "❌ عدد مثبت:"); bot.register_next_step_handler(msg, _edit_recv_manual_qty); return
+        msg = bot.send_message(cid, texts["positive_number"]); bot.register_next_step_handler(msg, _edit_recv_manual_qty); return
     _edit_add_item(cid, qty)
 
 def _edit_add_item(cid: int, qty: int):
@@ -1282,7 +1404,7 @@ def _edit_add_item(cid: int, qty: int):
 def _edit_proceed_fabric(cid: int):
     items = get_state(cid)["data"]["items"]
     if not items:
-        bot.send_message(cid, "⚠️ حداقل یک مدل انتخاب کن."); return
+        bot.send_message(cid, texts["select_at_least_one"]); return
     set_state(cid, S_EDIT_FABRIC)
     msg = bot.send_message(cid, f"{_format_cart(items)}\n\n🪡 نوع پارچه:")
     bot.register_next_step_handler(msg, _edit_recv_fabric)
@@ -1311,7 +1433,7 @@ def _edit_recv_manual_date(message: Message):
     cid = message.chat.id
     if get_state(cid).get("step") != S_EDIT_DATE: return
     if not validate_jalali(message.text.strip()):
-        msg = bot.send_message(cid, "❌ تاریخ شمسی معتبر نیست. فرمت: ۱۴۰۳/۰۶/۱۵")
+        msg = bot.send_message(cid, texts["invalid_date"])
         bot.register_next_step_handler(msg, _edit_recv_manual_date); return
     _edit_show_confirm(cid, jalali_to_gregorian(message.text.strip()))
 
@@ -1323,7 +1445,7 @@ def _edit_show_confirm(cid: int, delivery_date: str):
     kb = InlineKeyboardMarkup(row_width=2)
     kb.add(InlineKeyboardButton("✅ ذخیره ویرایش", callback_data="edit_confirm"),
            InlineKeyboardButton("❌ انصراف",        callback_data="edit_cancel"))
-    bot.send_message(cid, f"📝 <b>تغییرات:</b>\n\n{summary}\n\n💵 جمع جدید: {new_total:,}", reply_markup=kb)
+    bot.send_message(cid, f"📝 تغییرات:\n\n{summary}\n\n💵 جمع جدید: {new_total:,}", reply_markup=kb)
 
 @bot.callback_query_handler(func=lambda c: c.data == "edit_confirm")
 @safe_handler
@@ -1334,6 +1456,7 @@ def cb_edit_confirm(call: CallbackQuery):
     d = state["data"]; new_total = sum(i["line_total"] for i in d["items"])
     db_update_order_items(d["edit_order_id"], d["fabric"], d["delivery_date"],
                           d["items"], new_total, user["id"])
+    logger.info("Order edited | order_id=%s | user=%s | new_total=%s", d["edit_order_id"], user["name"] if user else cid, new_total)
     clear_state(cid); bot.answer_callback_query(call.id, "✅ ذخیره شد.")
     bot.send_message(cid, f"✅ سفارش #{d['edit_order_id']} ویرایش شد و منتظر تایید مجدد ادمین است.",
                      reply_markup=main_menu_kb())
@@ -1343,7 +1466,7 @@ def cb_edit_confirm(call: CallbackQuery):
 @safe_handler
 def cb_edit_cancel(call: CallbackQuery):
     clear_state(call.message.chat.id); bot.answer_callback_query(call.id)
-    bot.send_message(call.message.chat.id, "❌ ویرایش لغو شد.", reply_markup=main_menu_kb())
+    bot.send_message(call.message.chat.id, texts["edit_cancelled_msg"], reply_markup=main_menu_kb())
 
 # ════════════════════════════════════════════════════════════════
 #  ثبت سفارش جدید
@@ -1353,14 +1476,14 @@ def cb_edit_cancel(call: CallbackQuery):
 @safe_handler
 def btn_new_order(message: Message):
     cid = message.chat.id; user = db_get_user(cid)
-    if not user: bot.send_message(cid, "⛔️ دسترسی ندارید."); return
+    if not user: bot.send_message(cid, texts["no_access_short"]); return
     if user["is_banned"]:
-        bot.send_message(cid, "🚫 <b>حساب شما مسدود است.</b>\nبا ادمین تماس بگیرید."); return
+        bot.send_message(cid, texts["account_banned_msg_user"]); return
     models = db_get_active_models()
-    if not models: bot.send_message(cid, "⚠️ هیچ مدل فعالی وجود ندارد."); return
+    if not models: bot.send_message(cid, texts["no_active_models"]); return
     set_state(cid, S_SEL_MODEL, items=[], models=models, current_model_id=None)
     bot.send_message(cid,
-        "📦 <b>ثبت سفارش جدید</b>\nمدل‌ها رو انتخاب کن:",
+        "📦 ثبت سفارش جدید\nمدل‌ها رو انتخاب کن:",
         reply_markup=models_kb(models, []))
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("mdl_") and
@@ -1379,7 +1502,7 @@ def cb_model(call: CallbackQuery):
     if not model: bot.answer_callback_query(call.id, "❌"); return
     set_state(cid, S_ENTER_QTY, current_model_id=model_id)
     bot.answer_callback_query(call.id)
-    bot.send_message(cid, f"✅ <b>{model['name']}</b> ({model['price']:,})\nتعداد:", reply_markup=qty_kb())
+    bot.send_message(cid, f"✅ {model['name']} ({model['price']:,})\nتعداد:", reply_markup=qty_kb())
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("qty_") and
     get_state(c.message.chat.id).get("step") == S_ENTER_QTY)
@@ -1401,7 +1524,7 @@ def _recv_manual_qty(message: Message):
         qty = int(message.text.strip())
         if qty <= 0: raise ValueError
     except ValueError:
-        msg = bot.send_message(cid, "❌ عدد مثبت:"); bot.register_next_step_handler(msg, _recv_manual_qty); return
+        msg = bot.send_message(cid, texts["positive_number"]); bot.register_next_step_handler(msg, _recv_manual_qty); return
     _add_to_cart(cid, qty)
 
 def _add_to_cart(cid: int, qty: int):
@@ -1441,7 +1564,7 @@ def _recv_manual_date(message: Message):
     cid = message.chat.id
     if get_state(cid).get("step") != S_ENTER_DATE: return
     if not validate_jalali(message.text.strip()):
-        msg = bot.send_message(cid, "❌ تاریخ شمسی معتبر نیست. فرمت: ۱۴۰۳/۰۶/۱۵")
+        msg = bot.send_message(cid, texts["invalid_date"])
         bot.register_next_step_handler(msg, _recv_manual_date); return
     _proceed_to_note(cid, jalali_to_gregorian(message.text.strip()))
 
@@ -1483,18 +1606,19 @@ def cb_order_confirm(call: CallbackQuery):
     total = sum(i["line_total"] for i in d["items"])
     oid = db_create_order(user["id"], total, d["fabric"], d["delivery_date"],
                           d.get("note",""), d["items"])
+    logger.info("New order created | order_id=%s | user=%s | total=%s", oid, user["name"], total)
     clear_state(cid)
     summary = _format_order_summary(d["items"], d["fabric"], d["delivery_date"], d.get("note",""))
-    bot.send_message(cid, f"✅ <b>سفارش #{oid} ثبت شد!</b>\n\n{summary}\n\n⏳ منتظر تایید ادمین.",
+    bot.send_message(cid, f"✅ سفارش #{oid} ثبت شد!\n\n{summary}\n\n⏳ منتظر تایید ادمین.",
                      reply_markup=main_menu_kb())
-    _notify_admins(f"🔔 <b>سفارش جدید #{oid}</b>\n👤 {user['name']}\n\n{summary}",
+    _notify_admins(f"🔔 سفارش جدید #{oid}\n👤 {user['name']}\n\n{summary}",
                    admin_order_kb(oid))
 
 @bot.callback_query_handler(func=lambda c: c.data == "ord_cancel")
 @safe_handler
 def cb_order_cancel(call: CallbackQuery):
     clear_state(call.message.chat.id); bot.answer_callback_query(call.id)
-    bot.send_message(call.message.chat.id, "❌ سفارش لغو شد.", reply_markup=main_menu_kb())
+    bot.send_message(call.message.chat.id, texts["order_cancelled_msg"], reply_markup=main_menu_kb())
 
 # ════════════════════════════════════════════════════════════════
 #  بخش مالی کاربر
@@ -1504,20 +1628,20 @@ def cb_order_cancel(call: CallbackQuery):
 @safe_handler
 def btn_finance(message: Message):
     cid = message.chat.id; user = db_get_user(cid)
-    if not user: bot.send_message(cid, "⛔️ دسترسی ندارید."); return
+    if not user: bot.send_message(cid, texts["no_access_short"]); return
     fin = db_get_user_finance(user["id"])
     cmd = int(fin["current_month_debt"]) if fin else 0
     prv = int(fin["previous_debt"])      if fin else 0
     locked = db_get_active_installments_sum(user["id"])
     pnd = db_get_pending_payments(user["id"])
     pnd_sum = sum(int(p["amount"]) for p in pnd)
-    text = (f"💰 <b>بخش مالی</b>\n━━━━━━━━━━━━━━━━━━━━\n"
-            f"📅 بدهی ماه جاری: <b>{cmd:,}</b> تومان\n"
-            f"💳 بدهی قبلی:     <b>{prv:,}</b> تومان\n")
+    text = (f"💰 بخش مالی\n━━━━━━━━━━━━━━━━━━━━\n"
+            f"📅 بدهی ماه جاری: {cmd:,} تومان\n"
+            f"💳 بدهی قبلی:     {prv:,} تومان\n")
     if locked:
-        text += f"   └ از این مقدار، <b>{locked:,}</b> تومان قسط‌بندی شده (از «اقساط من» پرداخت کنید)\n"
-    text += f"📊 جمع کل:        <b>{cmd+prv:,}</b> تومان"
-    if pnd_sum: text += f"\n⏳ در انتظار تایید: <b>{pnd_sum:,}</b> تومان"
+        text += f"   └ از این مقدار، {locked:,} تومان قسط‌بندی شده (از «اقساط من» پرداخت کنید)\n"
+    text += f"📊 جمع کل:        {cmd+prv:,} تومان"
+    if pnd_sum: text += f"\n⏳ در انتظار تایید: {pnd_sum:,} تومان"
     text += "\n━━━━━━━━━━━━━━━━━━━━"
     bot.send_message(cid, text, reply_markup=finance_main_kb())
 
@@ -1528,10 +1652,10 @@ def cb_fin_history(call: CallbackQuery):
     if not user: bot.answer_callback_query(call.id,"⛔️"); return
     offset = int(call.data.split("_")[2]); bot.answer_callback_query(call.id)
     txs, total = db_get_transactions_paged(user["id"], offset)
-    if not txs: bot.send_message(cid, "📜 هیچ تراکنشی ثبت نشده."); return
+    if not txs: bot.send_message(cid, texts["no_transactions"]); return
 
     STATUS_T = {"pending":"⏳","approved":"✅","rejected":"❌",None:""}
-    lines = [f"📜 <b>تراکنش‌ها</b>  ({min(offset+PAGE_SIZE,total)}/{total})\n"]
+    lines = [f"📜 تراکنش‌ها  ({min(offset+PAGE_SIZE,total)}/{total})\n"]
     for tx in txs:
         tp = TYPE_FA.get(tx["type"], tx["type"])
         st = STATUS_T.get(tx.get("status"))
@@ -1550,12 +1674,12 @@ def cb_fin_inst(call: CallbackQuery):
     if not user: bot.answer_callback_query(call.id,"⛔️"); return
     bot.answer_callback_query(call.id)
     insts = db_get_installments(user["id"])
-    if not insts: bot.send_message(cid, "📋 هیچ قسط فعالی ندارید."); return
-    lines = ["📋 <b>اقساط فعال:</b>\n"]
+    if not insts: bot.send_message(cid, texts["no_active_installments"]); return
+    lines = ["📋 اقساط فعال:\n"]
     kb = InlineKeyboardMarkup(row_width=1)
     for i, inst in enumerate(insts, 1):
         remain = int(inst["total_amount"]) - int(inst["paid_amount"])
-        lines.append(f"{i}. کل:{int(inst['total_amount']):,}  |  باقی:<b>{remain:,}</b>\n"
+        lines.append(f"{i}. کل:{int(inst['total_amount']):,}  |  باقی:{remain:,}\n"
                      f"   {inst['num_installments']} قسط × {int(inst['per_installment']):,}")
         kb.add(InlineKeyboardButton(f"💳 پرداخت قسط #{inst['id']} (باقی:{remain:,})",
                                     callback_data=f"fin_pay_inst_{inst['id']}"))
@@ -1571,15 +1695,15 @@ def cb_fin_pay_inst(call: CallbackQuery):
     insts = db_get_installments(user["id"])
     inst = next((i for i in insts if i["id"] == inst_id), None)
     if not inst:
-        bot.answer_callback_query(call.id, "❌ قسط پیدا نشد یا قبلاً تکمیل شده."); return
+        bot.answer_callback_query(call.id, texts["installment_not_found"]); return
     remain = int(inst["total_amount"]) - int(inst["paid_amount"])
     if remain <= 0:
-        bot.answer_callback_query(call.id, "✅ این قسط قبلاً کامل پرداخت شده."); return
+        bot.answer_callback_query(call.id, texts["installment_already_paid"]); return
     bot.answer_callback_query(call.id)
     set_state(cid, S_PAY_AMOUNT, max_pay=remain, cmd=0, prv=remain, installment_id=inst_id)
     msg = bot.send_message(cid,
-        f"💳 <b>پرداخت قسط #{inst_id}</b>\n"
-        f"باقی‌مانده‌ی این قسط: <b>{remain:,}</b> تومان\n\n"
+        f"💳 پرداخت قسط #{inst_id}\n"
+        f"باقی‌مانده‌ی این قسط: {remain:,} تومان\n\n"
         f"مبلغ پرداختی (تومان):")
     bot.register_next_step_handler(msg, _recv_pay_amount)
 
@@ -1590,8 +1714,8 @@ def cb_fin_pending(call: CallbackQuery):
     if not user: bot.answer_callback_query(call.id,"⛔️"); return
     bot.answer_callback_query(call.id)
     pnd = db_get_pending_payments(user["id"])
-    if not pnd: bot.send_message(cid, "⏳ هیچ پرداختی در انتظار تایید ندارید."); return
-    lines = ["⏳ <b>در انتظار تایید:</b>\n"]
+    if not pnd: bot.send_message(cid, texts["no_pending_payments"]); return
+    lines = ["⏳ در انتظار تایید:\n"]
     for p in pnd:
         lines.append(f"• {int(p['amount']):,} تومان  |  {to_jalali_full(p['created_at'])}")
     bot.send_message(cid, "\n".join(lines))
@@ -1613,7 +1737,7 @@ def cb_fin_new_pay(call: CallbackQuery):
     prv_available = max(0, prv - locked)
     total = cmd + prv_available
     if total <= 0:
-        bot.answer_callback_query(call.id,"✅ بدهی آزاد ندارید!")
+        bot.answer_callback_query(call.id,texts["no_free_debt"])
         if locked > 0:
             bot.send_message(cid,
                 f"✅ بدهی ماه جاری و بدهی قبلیِ آزاد شما صفره.\n"
@@ -1624,8 +1748,8 @@ def cb_fin_new_pay(call: CallbackQuery):
     set_state(cid, S_PAY_AMOUNT, max_pay=total, cmd=cmd, prv=prv_available, installment_id=None)
     extra = f"\n⚠️ {locked:,} تومان از بدهی قبلی قسط‌بندی شده و اینجا قابل پرداخت نیست." if locked else ""
     msg = bot.send_message(cid,
-        f"💳 <b>ثبت پرداخت</b>\n\n📅 ماه جاری: {cmd:,}\n💳 قبلیِ آزاد: {prv_available:,}\n"
-        f"حداکثر: <b>{total:,}</b>{extra}\n\nمبلغ پرداختی (تومان):")
+        f"💳 ثبت پرداخت\n\n📅 ماه جاری: {cmd:,}\n💳 قبلیِ آزاد: {prv_available:,}\n"
+        f"حداکثر: {total:,}{extra}\n\nمبلغ پرداختی (تومان):")
     bot.register_next_step_handler(msg, _recv_pay_amount)
 
 @safe_handler
@@ -1636,7 +1760,7 @@ def _recv_pay_amount(message: Message):
         amount = int(message.text.strip().replace(",","").replace("،",""))
         if amount <= 0: raise ValueError
     except ValueError:
-        msg = bot.send_message(cid, "❌ عدد مثبت:"); bot.register_next_step_handler(msg, _recv_pay_amount); return
+        msg = bot.send_message(cid, texts["positive_number"]); bot.register_next_step_handler(msg, _recv_pay_amount); return
     d = get_state(cid)["data"]
     if amount > d["max_pay"]:
         msg = bot.send_message(cid, f"❌ حداکثر {d['max_pay']:,} تومان:")
@@ -1647,7 +1771,7 @@ def _recv_pay_amount(message: Message):
         set_state(cid, S_PAY_RECEIPT, pay_amount=amount, paid_current=0, paid_previous=amount)
         msg = bot.send_message(cid,
             f"💡 این مبلغ بابت قسط #{d['installment_id']} از بدهی قبلی کسر می‌شه.\n\n"
-            f"📎 فیش واریزی رو ارسال کن:")
+            + texts["send_receipt"])
     else:
         pc = min(amount, d["cmd"]); pp = min(amount - pc, d["prv"])
         set_state(cid, S_PAY_RECEIPT, pay_amount=amount, paid_current=pc, paid_previous=pp)
@@ -1663,13 +1787,26 @@ def _recv_receipt(message: Message):
     if message.photo:       file_id = message.photo[-1].file_id
     elif message.document:  file_id = message.document.file_id
     if not file_id:
-        msg = bot.send_message(cid, "❌ لطفاً تصویر یا فایل ارسال کن:")
+        msg = bot.send_message(cid, texts["send_image_or_file"])
         bot.register_next_step_handler(msg, _recv_receipt); return
-    set_state(cid, S_PAY_CONFIRM, receipt_file_id=file_id)
+    set_state(cid, S_PAY_NOTE, receipt_file_id=file_id)
+    msg = bot.send_message(cid,
+        "📝 اگه توضیح یا یادداشتی برای این پرداخت داری بنویس (مثلاً شماره پیگیری بانکی یا توضیح واریز).\n"
+        "اگه چیزی نداری «-» بفرست:")
+    bot.register_next_step_handler(msg, _recv_pay_note)
+
+@safe_handler
+def _recv_pay_note(message: Message):
+    cid = message.chat.id
+    if get_state(cid).get("step") != S_PAY_NOTE: return
+    note = message.text.strip() if message.text else "-"
+    note = None if note == "-" else note
+    set_state(cid, S_PAY_CONFIRM, user_note=note)
     d = get_state(cid)["data"]
+    note_line = f"\n📝 یادداشت: {note}" if note else ""
     bot.send_message(cid,
-        f"📋 مبلغ: <b>{d['pay_amount']:,}</b> تومان\n  └ ماه جاری: {d['paid_current']:,}\n"
-        f"  └ قبلی: {d['paid_previous']:,}\n\nارسال می‌کنی؟",
+        f"📋 مبلغ: {d['pay_amount']:,} تومان\n  └ ماه جاری: {d['paid_current']:,}\n"
+        f"  └ قبلی: {d['paid_previous']:,}{note_line}\n\nارسال می‌کنی؟",
         reply_markup=pay_confirm_kb())
 
 @bot.callback_query_handler(func=lambda c: c.data == "pay_submit")
@@ -1680,21 +1817,23 @@ def cb_pay_submit(call: CallbackQuery):
         bot.answer_callback_query(call.id,"⚠️"); return
     bot.answer_callback_query(call.id,"⏳ ارسال...")
     d = get_state(cid)["data"]; user = db_get_user(cid)
-    inst_id = d.get("installment_id")
-    tx_id = db_create_payment_request(user["id"], d["pay_amount"], d["receipt_file_id"], inst_id)
+    inst_id = d.get("installment_id"); user_note = d.get("user_note")
+    tx_id = db_create_payment_request(user["id"], d["pay_amount"], d["receipt_file_id"], inst_id, user_note)
+    logger.info("Payment request submitted | tx_id=%s | user=%s | amount=%s", tx_id, user["name"], d["pay_amount"])
     clear_state(cid)
-    bot.send_message(cid, f"✅ <b>درخواست #{tx_id} ارسال شد.</b>\nمنتظر تایید ادمین باش.",
+    bot.send_message(cid, f"✅ درخواست #{tx_id} ارسال شد.\nمنتظر تایید ادمین باش.",
                      reply_markup=main_menu_kb())
+    note_line = f"\n📝 یادداشت کاربر: {user_note}" if user_note else ""
     if inst_id:
-        cap = (f"🔔 <b>پرداخت قسط جدید #{tx_id}</b>\n👤 {user['name']}\n"
-               f"📋 قسط #{inst_id}\n💵 {d['pay_amount']:,} تومان")
+        cap = (f"🔔 پرداخت قسط جدید #{tx_id}\n👤 {user['name']}\n"
+               f"📋 قسط #{inst_id}\n💵 {d['pay_amount']:,} تومان{note_line}")
     else:
-        cap = (f"🔔 <b>پرداخت جدید #{tx_id}</b>\n👤 {user['name']}\n"
-               f"💵 {d['pay_amount']:,} تومان\n  └ ماه جاری:{d['paid_current']:,}\n  └ قبلی:{d['paid_previous']:,}")
+        cap = (f"🔔 پرداخت جدید #{tx_id}\n👤 {user['name']}\n"
+               f"💵 {d['pay_amount']:,} تومان\n  └ ماه جاری:{d['paid_current']:,}\n  └ قبلی:{d['paid_previous']:,}{note_line}")
     for ac in ADMIN_IDS:
         try:
             bot.send_photo(ac, d["receipt_file_id"], caption=cap, reply_markup=admin_payment_kb(tx_id))
-        except:
+        except Exception:
             try: bot.send_document(ac, d["receipt_file_id"], caption=cap, reply_markup=admin_payment_kb(tx_id))
             except Exception as e: print(f"[WARN] {e}")
 
@@ -1702,7 +1841,7 @@ def cb_pay_submit(call: CallbackQuery):
 @safe_handler
 def cb_pay_cancel(call: CallbackQuery):
     clear_state(call.message.chat.id); bot.answer_callback_query(call.id)
-    bot.send_message(call.message.chat.id, "❌ پرداخت لغو شد.", reply_markup=main_menu_kb())
+    bot.send_message(call.message.chat.id, texts["payment_cancelled"], reply_markup=main_menu_kb())
 
 # ════════════════════════════════════════════════════════════════
 #  ادمین - سفارشات
@@ -1713,7 +1852,7 @@ def cb_pay_cancel(call: CallbackQuery):
 def btn_admin_orders(message: Message):
     cid = message.chat.id
     if not _is_admin(cid): bot.send_message(cid,"⛔️"); return
-    bot.send_message(cid, "📋 <b>سفارشات</b>\nفیلتر:", reply_markup=order_filter_kb("aord"))
+    bot.send_message(cid, texts["admin_orders_filter"], reply_markup=order_filter_kb("aord"))
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("aord_") and c.data != "aord_back_filters")
 @safe_handler
@@ -1738,7 +1877,7 @@ def cb_admin_orders(call: CallbackQuery):
     pag = _paginate_kb(offset, total, f"aord_{status}_{offset-PAGE_SIZE}", f"aord_{status}_{offset+PAGE_SIZE}")
     if pag: kb.add(*pag)
     kb.add(InlineKeyboardButton("🔙 فیلترها", callback_data="aord_back_filters"))
-    bot.send_message(cid, f"📋 <b>{STATUS_FA.get(status,'سفارشات')}</b>  ({min(offset+PAGE_SIZE,total)}/{total})",
+    bot.send_message(cid, f"📋 {STATUS_FA.get(status,'سفارشات')}  ({min(offset+PAGE_SIZE,total)}/{total})",
                      reply_markup=kb)
 
 @bot.callback_query_handler(func=lambda c: c.data == "aord_back_filters")
@@ -1755,24 +1894,24 @@ def cb_admin_order_detail(call: CallbackQuery):
     order_id = int(call.data.split("_")[1]); is_super = _is_superadmin(cid)
     bot.answer_callback_query(call.id)
     order = db_get_order_full(order_id)
-    if not order: bot.send_message(cid,"❌ سفارش پیدا نشد."); return
+    if not order: bot.send_message(cid,texts["order_not_found"]); return
     user = db_get_user_by_db_id(order["user_id"])
     if is_super:
         items_text = "\n".join(f"  • {i['model_name']} ×{i['quantity']} = {int(i['line_total']):,}" for i in order["items"])
-        text = (f"📦 <b>سفارش #{order_id}</b>  |  {STATUS_FA.get(order['status'],'—')}\n"
+        text = (f"📦 سفارش #{order_id}  |  {STATUS_FA.get(order['status'],'—')}\n"
                 f"👤 {user['name'] if user else '—'}  |  📅 ثبت: {to_jalali_full(order['created_at'])}\n"
                 f"🚚 تحویل: {to_jalali(order['delivery_date'])}  |  🧵 پارچه: {order['fabric']}\n\n"
-                f"{items_text}\n\n💵 <b>{int(order['total_price']):,} تومان</b>")
+                f"{items_text}\n\n💵 {int(order['total_price']):,} تومان")
     else:
         items = db_get_order_items_no_price(order_id)
         items_text = "\n".join(f"  • {i['model_name']} ×{i['quantity']}" for i in items)
-        text = (f"📦 <b>سفارش #{order_id}</b>  |  {STATUS_FA.get(order['status'],'—')}\n"
+        text = (f"📦 سفارش #{order_id}  |  {STATUS_FA.get(order['status'],'—')}\n"
                 f"👤 {user['name'] if user else '—'}  |  📅 ثبت: {to_jalali_full(order['created_at'])}\n"
                 f"🚚 تحویل: {to_jalali(order['delivery_date'])}  |  🧵 پارچه: {order['fabric']}\n\n{items_text}")
     if order.get("note"): text += f"\n📝 یادداشت: {order['note']}"
     if order.get("rejection_reason"): text += f"\n❌ دلیل رد: {order['rejection_reason']}"
     if order.get("history"):
-        text += "\n\n📜 <b>تاریخچه‌ی وضعیت:</b>"
+        text += "\n\n📜 تاریخچه‌ی وضعیت:"
         for h in order["history"]:
             ts = to_jalali_full(h["changed_at"])
             by = f" - {h['admin_name']}" if h.get("admin_name") else ""
@@ -1795,6 +1934,7 @@ def cb_admin_set_status(call: CallbackQuery):
         msg = bot.send_message(cid, f"🚫 دلیل لغو سفارش #{order_id} (یا «-» برای رد کردن دلیل):")
         bot.register_next_step_handler(msg, _admin_cancel_reason, order_id); return
     db_update_order_status(order_id, status, admin_db_id=admin_id)
+    logger.info("Order status updated | order_id=%s | status=%s | admin_cid=%s", order_id, status, cid)
     bot.answer_callback_query(call.id, "✅ بروز شد.")
     bot.edit_message_reply_markup(cid, call.message.message_id, reply_markup=None)
     bot.send_message(cid, f"سفارش #{order_id} → {STATUS_FA.get(status,status)}")
@@ -1831,7 +1971,7 @@ def _notify_user_order_status(order_id: int, status: str, reason: str = None):
         "cancelled": f"🚫 سفارش #{order_id} لغو شد.",
     }
     if status in msgs:
-        try: bot.send_message(user["cid"], f"<b>{msgs[status]}</b>")
+        try: bot.send_message(user["cid"], f"{msgs[status]}")
         except Exception as e: print(f"[WARN] {e}")
 
 # ── تایید/رد سفارش از پیام ادمین ─────────────────────────────────
@@ -1864,7 +2004,7 @@ def cb_pay_approve(call: CallbackQuery):
     cid = call.message.chat.id
     if not _is_admin(cid): bot.answer_callback_query(call.id,"⛔️"); return
     tx_id = int(call.data.split("_")[2]); result = db_approve_payment(tx_id, _admin_db_id(cid))
-    if not result: bot.answer_callback_query(call.id,"⚠️ قبلاً پردازش شده."); return
+    if not result: bot.answer_callback_query(call.id,texts["already_processed"]); return
     bot.answer_callback_query(call.id,"✅ تایید شد.")
     bot.edit_message_reply_markup(cid, call.message.message_id, reply_markup=None)
     user = db_get_user_by_db_id(result["user_db_id"])
@@ -1877,7 +2017,7 @@ def cb_pay_approve(call: CallbackQuery):
         if user:
             try:
                 bot.send_message(user["cid"],
-                    f"✅ <b>پرداخت قسط {result['amount']:,} تومانی تایید شد!</b>\n"
+                    f"✅ پرداخت قسط {result['amount']:,} تومانی تایید شد!\n"
                     f"باقی‌مانده‌ی این قسط: {result['installment_remaining']:,}\n"
                     f"💳 بدهی قبلی: {result['new_prev']:,}")
             except: pass
@@ -1888,7 +2028,7 @@ def cb_pay_approve(call: CallbackQuery):
         if user:
             try:
                 bot.send_message(user["cid"],
-                    f"✅ <b>پرداخت {result['amount']:,} تومانی تایید شد!</b>\n"
+                    f"✅ پرداخت {result['amount']:,} تومانی تایید شد!\n"
                     f"📅 بدهی ماه جاری: {result['new_cmd']:,}\n💳 بدهی قبلی: {result['new_prev']:,}")
             except: pass
 
@@ -1905,13 +2045,14 @@ def cb_pay_reject(call: CallbackQuery):
 def _pay_reject_reason(message: Message, tx_id: int):
     reason = message.text.strip()
     db_reject_payment(tx_id, _admin_db_id(message.chat.id), reason)
+    logger.info("Payment rejected | tx_id=%s | admin_cid=%s | reason=%s", tx_id, message.chat.id, reason)
     bot.send_message(message.chat.id, f"✅ پرداخت #{tx_id} رد شد.")
     tx = db_get_transaction_by_id(tx_id)
     if tx:
         user = db_get_user_by_db_id(tx["user_id"])
         if user:
             try: bot.send_message(user["cid"],
-                     f"❌ <b>پرداخت {int(tx['amount']):,} تومانی رد شد.</b>\nدلیل: {reason}")
+                     f"❌ پرداخت {int(tx['amount']):,} تومانی رد شد.\nدلیل: {reason}")
             except: pass
 
 # ════════════════════════════════════════════════════════════════
@@ -1933,7 +2074,7 @@ def btn_sa_users(message: Message):
         kb.add(InlineKeyboardButton(f"بعدی {min(PAGE_SIZE,len(users)-PAGE_SIZE)}تا ▶️",
                                     callback_data=f"sa_ulist_{PAGE_SIZE}"))
     bot.send_message(cid,
-        f"👥 <b>کاربران ({len(users)} نفر)</b>\n🔴 مسدود:{banned}  |  💰 کل:{total_debt:,}",
+        f"👥 کاربران ({len(users)} نفر)\n🔴 مسدود:{banned}  |  💰 کل:{total_debt:,}",
         reply_markup=kb)
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("sa_ulist_"))
@@ -1966,12 +2107,12 @@ def cb_sa_user_detail(call: CallbackQuery):
     if not _is_superadmin(cid): bot.answer_callback_query(call.id,"⛔️"); return
     uid = int(call.data.split("_")[2]); bot.answer_callback_query(call.id)
     report = db_get_user_full_report(uid)
-    if not report: bot.send_message(cid,"❌ کاربر پیدا نشد."); return
+    if not report: bot.send_message(cid,texts["user_not_found"]); return
     u = report["user"]; f = report["finance"] or {}
     cmd = int(f.get("current_month_debt",0)); prv = int(f.get("previous_debt",0))
-    text = (f"👤 <b>{u['name']}</b>  |  {'🚫' if u['is_banned'] else '✅'}\n"
-            f"CID: <code>{u['cid']}</code>  |  @{u['username'] or '—'}\n\n"
-            f"💰 ماه جاری: <b>{cmd:,}</b>  |  قبلی: <b>{prv:,}</b>  |  جمع: <b>{cmd+prv:,}</b>\n")
+    text = (f"👤 {u['name']}  |  {'🚫' if u['is_banned'] else '✅'}\n"
+            f"CID: {u['cid']}  |  @{u['username'] or '—'}\n\n"
+            f"💰 ماه جاری: {cmd:,}  |  قبلی: {prv:,}  |  جمع: {cmd+prv:,}\n")
     if u["is_banned"] and u.get("ban_reason"): text += f"🚫 دلیل: {u['ban_reason']}\n"
     if report["installments"]:
         text += f"\n📋 اقساط: {len(report['installments'])} مورد فعال\n"
@@ -1987,6 +2128,141 @@ def cb_sa_user_detail(call: CallbackQuery):
             text += f"  {tp} {int(tx['amount']):,}ت  {to_jalali(tx['created_at'], '%m/%d')}\n"
     bot.send_message(cid, text, reply_markup=sa_user_actions_kb(uid, u["is_banned"]))
 
+# ── جزئیات کاربر: لیست کامل سفارشات ────────────────────────────────
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("sa_uord_"))
+@safe_handler
+def cb_sa_user_orders(call: CallbackQuery):
+    cid = call.message.chat.id
+    if not _is_superadmin(cid): bot.answer_callback_query(call.id,"⛔️"); return
+    uid = int(call.data.split("_")[2]); bot.answer_callback_query(call.id)
+    orders = db_get_user_orders_all(uid)
+    if not orders:
+        bot.send_message(cid, texts["no_orders_for_user"]); return
+    kb = InlineKeyboardMarkup(row_width=1)
+    for o in orders:
+        st = STATUS_EMOJI.get(o["status"], "•")
+        kb.add(InlineKeyboardButton(
+            f"{st} #{o['id']}  |  {int(o['total_price']):,}ت  |  {to_jalali(o['created_at'],'%m/%d')}",
+            callback_data=f"aodet_{o['id']}"))
+    kb.add(InlineKeyboardButton("🔙 برگشت به کاربر", callback_data=f"sa_u_{uid}"))
+    bot.send_message(cid, f"📦 همه‌ی سفارشات ({len(orders)} مورد):", reply_markup=kb)
+
+# ── جزئیات کاربر: لیست کامل تراکنش‌ها/پرداخت‌ها ─────────────────────
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("sa_utx_"))
+@safe_handler
+def cb_sa_user_transactions(call: CallbackQuery):
+    cid = call.message.chat.id
+    if not _is_superadmin(cid): bot.answer_callback_query(call.id,"⛔️"); return
+    uid = int(call.data.split("_")[2]); bot.answer_callback_query(call.id)
+    txs = db_get_user_transactions_all(uid)
+    if not txs:
+        bot.send_message(cid, texts["no_transactions_for_user"]); return
+    kb = InlineKeyboardMarkup(row_width=1)
+    for tx in txs:
+        tp = TYPE_FA.get(tx["type"], "•")
+        st_lbl = {"pending": "⏳", "approved": "✅", "rejected": "❌"}.get(tx.get("status"), "")
+        rec = "📎" if tx.get("receipt_file_id") else ""
+        kb.add(InlineKeyboardButton(
+            f"{tp} {st_lbl}{rec} {int(tx['amount']):,}ت  |  {to_jalali(tx['created_at'],'%m/%d')}",
+            callback_data=f"sa_txd_{tx['id']}"))
+    kb.add(InlineKeyboardButton("🔙 برگشت به کاربر", callback_data=f"sa_u_{uid}"))
+    bot.send_message(cid, f"💳 همه‌ی تراکنش‌ها ({len(txs)} مورد):", reply_markup=kb)
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("sa_txd_"))
+@safe_handler
+def cb_sa_tx_detail(call: CallbackQuery):
+    """جزئیات کامل یک تراکنش - شامل یادداشت کاربر و رسید پرداخت (در صورت وجود)."""
+    cid = call.message.chat.id
+    if not _is_superadmin(cid): bot.answer_callback_query(call.id,"⛔️"); return
+    tx_id = int(call.data.split("_")[2]); bot.answer_callback_query(call.id)
+    tx = db_get_transaction_by_id(tx_id)
+    if not tx: bot.send_message(cid, "❌ تراکنش پیدا نشد."); return
+    user = db_get_user_by_db_id(tx["user_id"])
+    tp = TYPE_FA.get(tx["type"], tx["type"])
+    st_lbl = {"pending": "⏳ در انتظار", "approved": "✅ تایید شده", "rejected": "❌ رد شده"}.get(tx.get("status"), "—")
+    text = (f"{tp}  |  {st_lbl}\n"
+            f"👤 {user['name'] if user else '—'}\n"
+            f"💵 مبلغ: {int(tx['amount']):,} تومان\n"
+            f"📅 {to_jalali_full(tx['created_at'])}\n")
+    if tx.get("installment_id"):
+        text += f"📋 مربوط به قسط #{tx['installment_id']}\n"
+    if tx.get("user_note"):
+        text += f"\n📝 یادداشت کاربر: {tx['user_note']}\n"
+    if tx.get("description"):
+        text += f"\nℹ️ {tx['description']}\n"
+    if tx.get("receipt_file_id"):
+        try:
+            bot.send_photo(cid, tx["receipt_file_id"], caption=text)
+        except Exception:
+            try:
+                bot.send_document(cid, tx["receipt_file_id"], caption=text)
+            except Exception:
+                bot.send_message(cid, text + "\n" + texts["receipt_not_shown"])
+    else:
+        bot.send_message(cid, text)
+
+# ── جزئیات کاربر: لیست کامل اقساط ───────────────────────────────────
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("sa_uinst_"))
+@safe_handler
+def cb_sa_user_installments_list(call: CallbackQuery):
+    cid = call.message.chat.id
+    if not _is_superadmin(cid): bot.answer_callback_query(call.id,"⛔️"); return
+    uid = int(call.data.split("_")[2]); bot.answer_callback_query(call.id)
+    insts = db_get_installments(uid)
+    if not insts:
+        bot.send_message(cid, texts["no_installments_for_user"]); return
+    kb = InlineKeyboardMarkup(row_width=1)
+    for i in insts:
+        done = "✅" if int(i["paid_amount"]) >= int(i["total_amount"]) else "⏳"
+        kb.add(InlineKeyboardButton(
+            f"{done} قسط #{i['id']}  |  {int(i['paid_amount']):,}/{int(i['total_amount']):,}ت",
+            callback_data=f"sa_instd_{i['id']}"))
+    kb.add(InlineKeyboardButton("🔙 برگشت به کاربر", callback_data=f"sa_u_{uid}"))
+    bot.send_message(cid, f"📋 همه‌ی اقساط ({len(insts)} مورد):", reply_markup=kb)
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("sa_instd_"))
+@safe_handler
+def cb_sa_installment_detail(call: CallbackQuery):
+    cid = call.message.chat.id
+    if not _is_superadmin(cid): bot.answer_callback_query(call.id,"⛔️"); return
+    inst_id = int(call.data.split("_")[2]); bot.answer_callback_query(call.id)
+    inst = db_get_installment_by_id(inst_id)
+    if not inst: bot.send_message(cid, "❌ قسط پیدا نشد."); return
+    user = db_get_user_by_db_id(inst["user_id"])
+    paid = int(inst["paid_amount"]); total = int(inst["total_amount"])
+    remaining = total - paid
+    text = (f"📋 قسط #{inst_id}\n"
+            f"👤 {user['name'] if user else '—'}\n"
+            f"💵 کل: {total:,}  |  پرداخت‌شده: {paid:,}  |  باقی: {remaining:,}\n"
+            f"📊 {inst['num_installments']} قسط × {int(inst['per_installment']):,} تومان\n"
+            f"📅 ثبت‌شده: {to_jalali_full(inst['created_at'])}"
+            f"{' | توسط ' + inst['admin_name'] if inst.get('admin_name') else ''}\n")
+    due = inst.get("due_dates")
+    if due:
+        try:
+            dates = json.loads(due) if isinstance(due, str) else due
+            def _greg_str_to_jalali(s):
+                try:
+                    import datetime as _dt
+                    g = _dt.date.fromisoformat(s)
+                    return jdatetime.date.fromgregorian(date=g).strftime("%Y/%m/%d")
+                except Exception:
+                    return s
+            text += "\n📆 سررسیدها:\n" + "\n".join(f"  • {_greg_str_to_jalali(d)}" for d in dates)
+        except Exception:
+            pass
+    payments = db_get_installment_payments(inst_id)
+    if payments:
+        text += "\n\n💳 پرداخت‌های ثبت‌شده برای این قسط:\n"
+        for p in payments:
+            st_lbl = {"pending": "⏳", "approved": "✅", "rejected": "❌"}.get(p.get("status"), "")
+            text += f"  {st_lbl} {int(p['amount']):,}ت  |  {to_jalali(p['created_at'],'%m/%d')}\n"
+    bot.send_message(cid, text)
+
+
 @bot.callback_query_handler(func=lambda c: c.data == "sa_add_user")
 @safe_handler
 def cb_sa_add_user(call: CallbackQuery):
@@ -1994,7 +2270,7 @@ def cb_sa_add_user(call: CallbackQuery):
     if not _is_superadmin(cid): bot.answer_callback_query(call.id,"⛔️"); return
     bot.answer_callback_query(call.id)
     set_state(cid, S_SA_ADD_USER_CID)
-    msg = bot.send_message(cid,"➕ <b>کاربر جدید</b>\nChat ID:")
+    msg = bot.send_message(cid,"➕ کاربر جدید\nChat ID:")
     bot.register_next_step_handler(msg, _sa_user_cid)
 
 @safe_handler
@@ -2023,11 +2299,12 @@ def _sa_user_un(m: Message):
     ok = db_add_user(d["new_cid"], d["new_name"], un, admin["id"])
     clear_state(cid)
     if ok:
-        bot.send_message(cid, f"✅ کاربر <b>{d['new_name']}</b> اضافه شد.")
-        try: bot.send_message(d["new_cid"], "🎉 حساب شما فعال شد!\n/start را بزنید.")
+        logger.info("New user added | cid=%s | name=%s | by_admin=%s", d["new_cid"], d["new_name"], cid)
+        bot.send_message(cid, f"✅ کاربر {d['new_name']} اضافه شد.")
+        try: bot.send_message(d["new_cid"], texts["account_activated"])
         except: pass
     else:
-        bot.send_message(cid,"⚠️ این کاربر قبلاً ثبت شده.")
+        bot.send_message(cid,texts["user_already_registered"])
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("sa_ban_"))
 @safe_handler
@@ -2035,11 +2312,12 @@ def cb_sa_ban(call: CallbackQuery):
     cid = call.message.chat.id
     if not _is_superadmin(cid): bot.answer_callback_query(call.id,"⛔️"); return
     uid = int(call.data.split("_")[2]); bot.answer_callback_query(call.id)
-    db_ban_user(uid, "مسدود توسط سوپرادمین")
-    bot.send_message(cid,"🚫 کاربر مسدود شد.")
+    db_ban_user(uid, texts["ban_reason_admin"])
+    logger.info("User banned by superadmin | uid=%s | admin_cid=%s", uid, cid)
+    bot.send_message(cid,texts["user_banned_msg"])
     user = db_get_user_by_db_id(uid)
     if user:
-        try: bot.send_message(user["cid"],"🚫 حساب شما مسدود شد. با ادمین تماس بگیرید.")
+        try: bot.send_message(user["cid"],texts["account_banned_by_admin"])
         except: pass
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("sa_unban_"))
@@ -2048,10 +2326,12 @@ def cb_sa_unban(call: CallbackQuery):
     cid = call.message.chat.id
     if not _is_superadmin(cid): bot.answer_callback_query(call.id,"⛔️"); return
     uid = int(call.data.split("_")[2]); bot.answer_callback_query(call.id)
-    db_unban_user(uid); bot.send_message(cid,"✅ مسدودی رفع شد.")
+    db_unban_user(uid)
+    logger.info("User unbanned by superadmin | uid=%s | admin_cid=%s", uid, cid)
+    bot.send_message(cid,texts["user_unbanned_msg"])
     user = db_get_user_by_db_id(uid)
     if user:
-        try: bot.send_message(user["cid"],"✅ مسدودی حساب شما رفع شد.")
+        try: bot.send_message(user["cid"],texts["account_unbanned"])
         except: pass
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("sa_deact_user_"))
@@ -2060,7 +2340,7 @@ def cb_sa_deact_user(call: CallbackQuery):
     cid = call.message.chat.id
     if not _is_superadmin(cid): bot.answer_callback_query(call.id,"⛔️"); return
     uid = int(call.data.split("_")[3]); bot.answer_callback_query(call.id)
-    db_deactivate_user(uid); bot.send_message(cid,"🗑 کاربر غیرفعال شد.")
+    db_deactivate_user(uid); bot.send_message(cid,texts["user_deactivated_msg"])
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("sa_del_user_"))
 @safe_handler
@@ -2072,7 +2352,7 @@ def cb_sa_del_user(call: CallbackQuery):
     kb.add(InlineKeyboardButton("🔴 بله، حذف کامل", callback_data=f"sa_del_confirm_{uid}"),
            InlineKeyboardButton("❌ انصراف",          callback_data="sa_del_abort"))
     bot.answer_callback_query(call.id)
-    bot.send_message(cid,"⚠️ <b>حذف کامل کاربر</b>\nهمه سفارشات و تراکنش‌ها هم پاک میشن. مطمئنی؟",
+    bot.send_message(cid,texts["confirm_delete_user"],
                      reply_markup=kb)
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("sa_del_confirm_"))
@@ -2082,7 +2362,9 @@ def cb_sa_del_confirm(call: CallbackQuery):
     if not _is_superadmin(cid): bot.answer_callback_query(call.id,"⛔️"); return
     uid = int(call.data.split("_")[3])
     user = db_get_user_by_db_id(uid)
-    db_delete_user(uid); bot.answer_callback_query(call.id,"✅ حذف شد.")
+    db_delete_user(uid)
+    logger.info("User permanently deleted | uid=%s | name=%s | by_admin=%s", uid, user["name"] if user else "?", cid)
+    bot.answer_callback_query(call.id,"✅ حذف شد.")
     bot.send_message(cid, f"🗑 کاربر {user['name'] if user else uid} حذف شد.")
 
 @bot.callback_query_handler(func=lambda c: c.data == "sa_del_abort")
@@ -2098,8 +2380,9 @@ def cb_sa_transfer(call: CallbackQuery):
     uid = int(call.data.split("_")[2]); admin = db_get_admin(cid)
     bot.answer_callback_query(call.id,"⏳...")
     amount = db_transfer_debt_to_previous(uid, admin["id"])
-    if amount == 0: bot.send_message(cid,"⚠️ بدهی ماه جاری ندارد."); return
-    bot.send_message(cid, f"✅ <b>{amount:,} تومان</b> منتقل شد. پنل باز شد.")
+    if amount == 0: bot.send_message(cid,texts["no_current_debt"]); return
+    logger.info("Debt transferred to previous | uid=%s | amount=%s | by_admin=%s", uid, amount, cid)
+    bot.send_message(cid, f"✅ {amount:,} تومان منتقل شد. پنل باز شد.")
     user = db_get_user_by_db_id(uid)
     if user:
         try: bot.send_message(user["cid"],
@@ -2124,7 +2407,7 @@ def _sa_debt_amt(m: Message):
         amount = int(m.text.strip().replace(",","").replace("،",""))
         if amount<=0: raise ValueError
     except ValueError:
-        msg = bot.send_message(cid,"❌ عدد مثبت:"); bot.register_next_step_handler(msg,_sa_debt_amt); return
+        msg = bot.send_message(cid,texts["positive_number"]); bot.register_next_step_handler(msg,_sa_debt_amt); return
     set_state(cid, S_SA_DEBT_DESC, debt_amount=amount)
     msg = bot.send_message(cid,"توضیح:"); bot.register_next_step_handler(msg,_sa_debt_desc)
 
@@ -2134,6 +2417,7 @@ def _sa_debt_desc(m: Message):
     if get_state(cid).get("step") != S_SA_DEBT_DESC: return
     d = get_state(cid)["data"]; admin = db_get_admin(cid)
     db_add_manual_debt(d["target_uid"], d["debt_amount"], m.text.strip(), admin["id"])
+    logger.info("Manual debt added | uid=%s | amount=%s | by_admin=%s", d["target_uid"], d["debt_amount"], cid)
     clear_state(cid)
     bot.send_message(cid, f"✅ {d['debt_amount']:,} تومان بدهی اضافه شد.")
     user = db_get_user_by_db_id(d["target_uid"])
@@ -2154,15 +2438,15 @@ def cb_sa_inst(call: CallbackQuery):
     available = prev - already
     if available <= 0:
         bot.send_message(cid,
-            f"⚠️ بدهی قبلی این کاربر <b>{prev:,}</b> تومانه که "
-            f"<b>{already:,}</b> تومانش از قبل قسط‌بندی شده.\n"
+            f"⚠️ بدهی قبلی این کاربر {prev:,} تومانه که "
+            f"{already:,} تومانش از قبل قسط‌بندی شده.\n"
             f"چیزی برای قسط‌بندی جدید آزاد نیست.")
         return
     set_state(cid, S_SA_INST_AMOUNT, target_uid=uid, inst_available=available)
     msg = bot.send_message(cid,
-        f"📋 <b>قسط‌بندی جدید</b>\n"
+        f"📋 قسط‌بندی جدید\n"
         f"💳 بدهی قبلی: {prev:,}  |  قبلاً قسط‌بندی شده: {already:,}\n"
-        f"✅ حداکثر قابل قسط‌بندی: <b>{available:,}</b> تومان\n\n"
+        f"✅ حداکثر قابل قسط‌بندی: {available:,} تومان\n\n"
         f"کل مبلغ قسط‌بندی رو وارد کن:")
     bot.register_next_step_handler(msg,_sa_inst_amt)
 
@@ -2174,7 +2458,7 @@ def _sa_inst_amt(m: Message):
         amount = int(m.text.strip().replace(",","").replace("،",""))
         if amount<=0: raise ValueError
     except ValueError:
-        msg = bot.send_message(cid,"❌ عدد مثبت:"); bot.register_next_step_handler(msg,_sa_inst_amt); return
+        msg = bot.send_message(cid,texts["positive_number"]); bot.register_next_step_handler(msg,_sa_inst_amt); return
     available = get_state(cid)["data"]["inst_available"]
     if amount > available:
         msg = bot.send_message(cid,
@@ -2189,12 +2473,12 @@ def _sa_inst_count(m: Message):
     if get_state(cid).get("step") != S_SA_INST_COUNT: return
     try:
         count = int(m.text.strip()); assert count>0
-    except:
-        msg = bot.send_message(cid,"❌ عدد مثبت:"); bot.register_next_step_handler(msg,_sa_inst_count); return
+    except (ValueError, AssertionError):
+        msg = bot.send_message(cid,texts["positive_number"]); bot.register_next_step_handler(msg,_sa_inst_count); return
     d = get_state(cid)["data"]; per = d["inst_total"]//count
     set_state(cid, S_SA_INST_DATES, inst_count=count, per_inst=per)
     msg = bot.send_message(cid,
-        f"هر قسط: {per:,} تومان\n\n{count} تاریخ سررسید (خط به خط، YYYY-MM-DD):")
+        f"هر قسط: {per:,} تومان\n\n{count} تاریخ سررسید (خط به خط، شمسی — مثال: ۱۴۰۳/۰۶/۱۵):")
     bot.register_next_step_handler(msg,_sa_inst_dates)
 
 @safe_handler
@@ -2215,10 +2499,12 @@ def _sa_inst_dates(m: Message):
     iid, err_available = db_add_installment(d["target_uid"], d["inst_total"], d["inst_count"], lines, admin["id"])
     clear_state(cid)
     if iid is None:
+        logger.warning("Installment creation failed (exceeds available debt) | uid=%s | requested=%s | available=%s", d["target_uid"], d["inst_total"], err_available)
         bot.send_message(cid,
             f"❌ مبلغ قسط‌بندی از سقف بدهی قبلیِ آزاد ({err_available:,} تومان) بیشتر شده "
             f"(احتمالاً همزمان یه قسط‌بندی دیگه ثبت شده). دوباره از منوی کاربر امتحان کن.")
         return
+    logger.info("Installment created | iid=%s | uid=%s | total=%s | count=%s | by_admin=%s", iid, d["target_uid"], d["inst_total"], d["inst_count"], cid)
     bot.send_message(cid, f"✅ قسط‌بندی #{iid} ثبت شد.")
     user = db_get_user_by_db_id(d["target_uid"])
     if user:
@@ -2236,7 +2522,7 @@ def btn_sa_models(message: Message):
     cid = message.chat.id
     if not _is_superadmin(cid): bot.send_message(cid,"⛔️"); return
     models = db_get_all_models()
-    bot.send_message(cid, f"📦 <b>مدل‌ها ({len(models)})</b>",
+    bot.send_message(cid, f"📦 مدل‌ها ({len(models)})",
                      reply_markup=sa_models_kb(models))
 
 @bot.callback_query_handler(func=lambda c: c.data == "sa_models_list")
@@ -2255,7 +2541,7 @@ def cb_sa_mdl_detail(call: CallbackQuery):
     if not _is_superadmin(cid): bot.answer_callback_query(call.id,"⛔️"); return
     mid = int(call.data.split("_")[2]); bot.answer_callback_query(call.id)
     model = db_get_model_by_id(mid)
-    if not model: bot.send_message(cid,"❌ مدل پیدا نشد."); return
+    if not model: bot.send_message(cid,texts["model_not_found"]); return
     conn = get_connection(); cur = conn.cursor(dictionary=True)
     cur.execute("""
         SELECT mp.price, mp.set_at, a.name AS aname FROM model_prices mp
@@ -2263,8 +2549,8 @@ def cb_sa_mdl_detail(call: CallbackQuery):
     """, (mid,)); hist = cur.fetchall(); cur.close(); conn.close()
     hist_text = "\n".join(f"  • {int(p['price']):,}  {to_jalali(p['set_at'])}  {p['aname'] or '—'}" for p in hist)
     bot.send_message(cid,
-        f"📦 <b>{model['name']}</b>  |  {'✅ فعال' if model['is_active'] else '❌ غیرفعال'}\n"
-        f"قیمت فعلی: <b>{int(model['price']):,}</b>\n\n📜 تاریخچه:\n{hist_text or '—'}",
+        f"📦 {model['name']}  |  {'✅ فعال' if model['is_active'] else '❌ غیرفعال'}\n"
+        f"قیمت فعلی: {int(model['price']):,}\n\n📜 تاریخچه:\n{hist_text or '—'}",
         reply_markup=sa_model_actions_kb(mid, model["is_active"]))
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("sa_mdl_tog_"))
@@ -2293,11 +2579,12 @@ def _sa_set_price(m: Message):
         price = int(m.text.strip().replace(",","").replace("،",""))
         if price<=0: raise ValueError
     except ValueError:
-        msg = bot.send_message(cid,"❌ عدد مثبت:"); bot.register_next_step_handler(msg,_sa_set_price); return
+        msg = bot.send_message(cid,texts["positive_number"]); bot.register_next_step_handler(msg,_sa_set_price); return
     d = get_state(cid)["data"]; admin = db_get_admin(cid)
     model = db_get_model_by_id(d["price_mid"])
     db_set_model_price(d["price_mid"], price, admin["id"]); clear_state(cid)
-    bot.send_message(cid, f"✅ قیمت <b>{model['name']}</b> → <b>{price:,}</b> تومان")
+    logger.info("Model price updated | model_id=%s | name=%s | price=%s | by_admin=%s", d["price_mid"], model["name"], price, cid)
+    bot.send_message(cid, f"✅ قیمت {model['name']} → {price:,} تومان")
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("sa_mdl_deact_"))
 @safe_handler
@@ -2318,7 +2605,7 @@ def cb_mdl_del(call: CallbackQuery):
     kb.add(InlineKeyboardButton("🔴 حذف کامل", callback_data=f"sa_mdl_del_ok_{mid}"),
            InlineKeyboardButton("❌ انصراف",    callback_data="sa_del_abort"))
     bot.answer_callback_query(call.id)
-    bot.send_message(cid,"⚠️ <b>حذف مدل</b>\nمطمئنی؟ (سفارشات قبلی تاثیر می‌گیرن)", reply_markup=kb)
+    bot.send_message(cid,texts["confirm_delete_model"], reply_markup=kb)
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("sa_mdl_del_ok_"))
 @safe_handler
@@ -2342,7 +2629,7 @@ def _sa_mdl_name(m: Message):
     cid = m.chat.id
     if get_state(cid).get("step") != S_SA_MDL_NAME: return
     set_state(cid, S_SA_MDL_PRICE, mdl_name=m.text.strip())
-    msg = bot.send_message(cid,f"قیمت اولیه <b>{m.text.strip()}</b> (تومان):")
+    msg = bot.send_message(cid,f"قیمت اولیه {m.text.strip()} (تومان):")
     bot.register_next_step_handler(msg,_sa_mdl_price)
 
 @safe_handler
@@ -2353,10 +2640,11 @@ def _sa_mdl_price(m: Message):
         price = int(m.text.strip().replace(",","").replace("،",""))
         if price<=0: raise ValueError
     except ValueError:
-        msg = bot.send_message(cid,"❌ عدد مثبت:"); bot.register_next_step_handler(msg,_sa_mdl_price); return
+        msg = bot.send_message(cid,texts["positive_number"]); bot.register_next_step_handler(msg,_sa_mdl_price); return
     d = get_state(cid)["data"]; admin = db_get_admin(cid)
     mid = db_add_model(d["mdl_name"], price, admin["id"]); clear_state(cid)
-    bot.send_message(cid, f"✅ مدل <b>{d['mdl_name']}</b> (قیمت:{price:,}) اضافه شد. #{mid}")
+    logger.info("Model added | model_id=%s | name=%s | price=%s | by_admin=%s", mid, d["mdl_name"], price, cid)
+    bot.send_message(cid, f"✅ مدل {d['mdl_name']} (قیمت:{price:,}) اضافه شد. #{mid}")
 
 # ════════════════════════════════════════════════════════════════
 #  مدیریت ادمین‌ها
@@ -2397,7 +2685,7 @@ def btn_sa_admins(message: Message):
     cid = message.chat.id
     if not _is_superadmin(cid): bot.send_message(cid,"⛔️"); return
     admins = db_get_all_admins()
-    bot.send_message(cid, f"👮 <b>ادمین‌ها ({len(admins)})</b>", reply_markup=sa_admins_kb(admins))
+    bot.send_message(cid, f"👮 ادمین‌ها ({len(admins)})", reply_markup=sa_admins_kb(admins))
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("sa_adm_detail_"))
 @safe_handler
@@ -2406,14 +2694,14 @@ def cb_sa_admin_detail(call: CallbackQuery):
     if not _is_superadmin(cid): bot.answer_callback_query(call.id,"⛔️"); return
     aid = int(call.data.split("_")[3]); bot.answer_callback_query(call.id)
     admin = db_get_admin_by_db_id(aid)
-    if not admin: bot.send_message(cid,"❌ پیدا نشد."); return
+    if not admin: bot.send_message(cid,texts["admin_not_found"]); return
     kb = InlineKeyboardMarkup(row_width=1)
     if admin["cid"] != cid:  # نمیتونه خودشو حذف کنه
         kb.add(InlineKeyboardButton("🗑 حذف ادمین", callback_data=f"sa_adm_del_{aid}"))
     kb.add(InlineKeyboardButton("🔙 لیست ادمین‌ها", callback_data="sa_admins_list"))
     bot.send_message(cid,
-        f"👮 <b>{admin['name']}</b>\nنقش: {'🔑 سوپرادمین' if admin['role']=='superadmin' else '🛠 ادمین عادی'}\n"
-        f"CID: <code>{admin['cid']}</code>", reply_markup=kb)
+        f"👮 {admin['name']}\nنقش: {'🔑 سوپرادمین' if admin['role']=='superadmin' else '🛠 ادمین عادی'}\n"
+        f"CID: {admin['cid']}", reply_markup=kb)
 
 @bot.callback_query_handler(func=lambda c: c.data == "sa_admins_list")
 @safe_handler
@@ -2431,7 +2719,7 @@ def cb_sa_admin_del(call: CallbackQuery):
     aid = int(call.data.split("_")[3])
     admin = db_get_admin_by_db_id(aid)
     if admin and admin["cid"] == cid:
-        bot.answer_callback_query(call.id,"⚠️ نمی‌تونی خودتو حذف کنی."); return
+        bot.answer_callback_query(call.id,texts["cant_delete_self"]); return
     db_delete_admin(aid); bot.answer_callback_query(call.id,"✅ حذف شد.")
     bot.send_message(cid, f"🗑 ادمین {admin['name'] if admin else aid} حذف شد.")
 
@@ -2441,7 +2729,7 @@ def cb_sa_add_admin(call: CallbackQuery):
     cid = call.message.chat.id
     if not _is_superadmin(cid): bot.answer_callback_query(call.id,"⛔️"); return
     bot.answer_callback_query(call.id); set_state(cid, S_SA_ADD_ADM_CID)
-    msg = bot.send_message(cid,"➕ <b>افزودن ادمین جدید</b>\nChat ID:")
+    msg = bot.send_message(cid,"➕ افزودن ادمین جدید\nChat ID:")
     bot.register_next_step_handler(msg,_sa_adm_cid)
 
 @safe_handler
@@ -2473,11 +2761,11 @@ def cb_sa_adm_role(call: CallbackQuery):
     d = get_state(cid)["data"]
     ok = db_add_admin(d["adm_cid"], d["adm_name"], role); clear_state(cid)
     if ok:
-        bot.send_message(cid, f"✅ ادمین <b>{d['adm_name']}</b> ({role}) اضافه شد.")
-        try: bot.send_message(d["adm_cid"],"🎉 شما به عنوان ادمین اضافه شدید!\n/start را بزنید.")
+        bot.send_message(cid, f"✅ ادمین {d['adm_name']} ({role}) اضافه شد.")
+        try: bot.send_message(d["adm_cid"],texts["admin_added_notification"])
         except: pass
     else:
-        bot.send_message(cid,"⚠️ این کاربر قبلاً ادمین است.")
+        bot.send_message(cid,texts["admin_already_exists"])
 
 # ════════════════════════════════════════════════════════════════
 #  سوپرادمین - گزارش مالی
@@ -2498,10 +2786,10 @@ def btn_sa_report(message: Message):
     mo = int(cur.fetchone()["t"]); cur.close(); conn.close()
     cmd = int(fin["cmd"] or 0); prv = int(fin["prv"] or 0)
     bot.send_message(cid,
-        f"📊 <b>گزارش مالی</b>\n━━━━━━━━━━━━━━━━━━━━\n"
-        f"💰 بدهی ماه جاری: <b>{cmd:,}</b>\n"
-        f"💳 بدهی قبلی:     <b>{prv:,}</b>\n"
-        f"📊 جمع کل:        <b>{cmd+prv:,}</b>\n"
+        f"📊 گزارش مالی\n━━━━━━━━━━━━━━━━━━━━\n"
+        f"💰 بدهی ماه جاری: {cmd:,}\n"
+        f"💳 بدهی قبلی:     {prv:,}\n"
+        f"📊 جمع کل:        {cmd+prv:,}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"📦 سفارشات این ماه: {mo:,}\n"
         f"⏳ سفارش pending:   {po}\n"
@@ -2518,7 +2806,7 @@ def btn_sa_broadcast(message: Message):
     cid = message.chat.id
     if not _is_superadmin(cid): bot.send_message(cid,"⛔️"); return
     set_state(cid, S_SA_BROADCAST)
-    msg = bot.send_message(cid,"📣 پیامی که می‌خوای به همه کاربران ارسال بشه رو بنویس:")
+    msg = bot.send_message(cid,texts["broadcast_prompt"])
     bot.register_next_step_handler(msg, _sa_broadcast_recv)
 
 @safe_handler
@@ -2527,13 +2815,18 @@ def _sa_broadcast_recv(message: Message):
     if get_state(cid).get("step") != S_SA_BROADCAST: return
     text = message.text.strip(); clear_state(cid)
     users = db_get_all_users_summary()
-    sent = 0; failed = 0
+    logger.info("Broadcast started | total_users=%s | by_admin=%s", len(users), cid)
     bot.send_message(cid, f"⏳ ارسال به {len(users)} کاربر...")
+    threading.Thread(target=_do_broadcast, args=(cid, users, text), daemon=True).start()
+
+def _do_broadcast(cid: int, users: list, text: str):
+    sent = 0; failed = 0
     for u in users:
         try:
-            bot.send_message(u["cid"], f"📣 <b>پیام از ادمین:</b>\n\n{text}")
+            bot.send_message(u["cid"], f"📣 پیام از ادمین:\n\n{text}")
             sent += 1
-        except:
+            time.sleep(0.05)
+        except Exception:
             failed += 1
     bot.send_message(cid, f"✅ ارسال تموم شد.\nموفق: {sent}  |  ناموفق: {failed}")
 
@@ -2553,7 +2846,8 @@ def _jalali_deadline() -> datetime:
 def _schedule_next(target: datetime):
     wait = max((target - datetime.now()).total_seconds(), 0)
     next_j = jdatetime.datetime.fromgregorian(datetime=target)
-    print(f"[SCHEDULER] بعدی: {next_j.strftime('%Y/%m/%d %H:%M')} ({wait/3600:.1f}h)")
+    print(f"[SCHEDULER] Next run: {next_j.strftime('%Y/%m/%d %H:%M')} ({wait/3600:.1f}h)")
+    sched_logger.info("Next scheduled run: %s (in %.1f hours)", next_j.strftime('%Y/%m/%d %H:%M'), wait/3600)
     t = threading.Timer(wait, _run_ban_check)
     t.daemon = True; t.start()
 
@@ -2567,11 +2861,12 @@ def _run_ban_check():
         _run_ban_check_inner()
     except Exception as e:
         print(f"[SCHEDULER ERROR] {type(e).__name__}: {e}")
+        sched_logger.exception("Error in auto-ban check execution: %s: %s", type(e).__name__, e)
         traceback.print_exc()
         for admin_cid in ADMIN_IDS:
             try:
                 bot.send_message(admin_cid,
-                    f"⚠️ <b>خطا در اجرای بررسی بن خودکار</b>\n<code>{type(e).__name__}: {str(e)[:300]}</code>")
+                    f"⚠️ خطا در اجرای بررسی بن خودکار\n{type(e).__name__}: {str(e)[:300]}")
             except Exception:
                 pass
         # حتی اگه خطا خورد، باید ماه بعد دوباره تلاش کنه
@@ -2583,22 +2878,42 @@ def _run_ban_check():
 
 def _run_ban_check_inner():
     now_j = jdatetime.datetime.now(); month_name = now_j.strftime("%B %Y")
-    print(f"[SCHEDULER] بررسی بن — {now_j.strftime('%Y/%m/%d %H:%M')}")
+    print(f"[SCHEDULER] Auto-ban check — {now_j.strftime('%Y/%m/%d %H:%M')}")
+    sched_logger.info("Starting auto-ban check — %s", now_j.strftime('%Y/%m/%d %H:%M'))
     debtors = db_get_users_with_current_debt()
     if not debtors:
-        print("[SCHEDULER] هیچ بدهکاری نیست.")
+        print("[SCHEDULER] No debtors found.")
+        sched_logger.info("No debtors found.")
         _schedule_next_month(); return
     banned = []
+    skipped = 0
     for u in debtors:
-        reason = f"عدم تسویه {month_name} — {int(u['current_month_debt']):,} تومان"
+        # Re-verify debt is still unpaid (prevents banning users who paid between fetch and loop)
+        fresh_fin = db_get_user_finance(u["id"])
+        if not fresh_fin or int(fresh_fin.get("current_month_debt", 0)) <= 0:
+            sched_logger.info("Skipping user id=%s (debt cleared before ban)", u["id"])
+            skipped += 1
+            continue
+        # Also skip if already banned (avoid duplicate ban_reason overwrite)
+        fresh_user = db_get_user_by_db_id(u["id"])
+        if fresh_user and fresh_user.get("is_banned"):
+            sched_logger.info("Skipping user id=%s (already banned)", u["id"])
+            skipped += 1
+            continue
+        reason = f"عدم تسویه {month_name} — {int(fresh_fin['current_month_debt']):,} تومان"
         db_ban_user(u["id"], reason); banned.append(u)
+        sched_logger.info("User banned: id=%s | name=%s | debt=%s Toman",
+                          u["id"], u.get("name", "—"), int(fresh_fin["current_month_debt"]))
         try: bot.send_message(u["cid"],
-                 f"🚫 <b>حساب مسدود شد.</b>\nبدهی ماه {month_name}: {int(u['current_month_debt']):,} تومان\nبا ادمین تماس بگیرید.")
+                 f"🚫 حساب مسدود شد.\nبدهی ماه {month_name}: {int(fresh_fin['current_month_debt']):,} تومان\nبا ادمین تماس بگیرید.")
         except: pass
-    report = f"🔴 <b>بن اتوماتیک — {month_name}</b>\nتعداد: {len(banned)}\n\n"
+    if skipped:
+        sched_logger.info("Skipped %d user(s) (paid or already banned before loop)", skipped)
+    report = f"🔴 بن اتوماتیک — {month_name}\nتعداد: {len(banned)}\n\n"
     report += "\n".join(f"• {u['name']}  {int(u['current_month_debt']):,}ت" for u in banned)
     _notify_admins(report)
-    print(f"[SCHEDULER] {len(banned)} کاربر بن شدن.")
+    print(f"[SCHEDULER] {len(banned)} user(s) banned.")
+    sched_logger.info("Auto-ban check finished. Total banned: %d", len(banned))
     _schedule_next_month()
 
 def _schedule_next_month():
@@ -2611,7 +2926,7 @@ def _schedule_next_month():
 def start_scheduler():
     deadline = _jalali_deadline()
     if datetime.now() >= deadline:
-        print("[SCHEDULER] از deadline رد شدیم — اجرای فوری...")
+        print("[SCHEDULER] Deadline already passed — running immediately...")
         t = threading.Timer(10, _run_ban_check); t.daemon = True; t.start()
     else:
         _schedule_next(deadline)
@@ -2623,17 +2938,22 @@ def start_scheduler():
 def info_listener(messages):
     for m in messages:
         print(f"[MSG] {m.chat.username or m.chat.id}: {m.text or m.content_type}")
+        logger.info("MSG | user=%s | cid=%s | content=%s",
+                    m.chat.username or "—", m.chat.id, m.text or m.content_type)
 
 bot.set_update_listener(info_listener)
 
-print("ربات شروع به کار کرد...")
+print("Bot started...")
+logger.info("=" * 60)
+logger.info("Bot started successfully")
 
 try:
     start_scheduler()
 except Exception as e:
-    print(f"[STARTUP ERROR] راه‌اندازی scheduler ناموفق بود: {e}")
+    print(f"[STARTUP ERROR] Scheduler startup failed: {e}")
+    sched_logger.exception("Scheduler startup failed: %s", e)
     traceback.print_exc()
-    print("[STARTUP] ربات بدون سیستم بن خودکار ادامه می‌ده.")
+    print("[STARTUP] Bot running without auto-ban scheduler.")
 
 # infinity_polling خودش retry داخلی داره، ولی برای اطمینان بیشتر
 # (مثلاً قطعی کامل شبکه که polling رو از کار بندازه) یه لایه‌ی محافظ بیرونی هم می‌ذاریم
@@ -2642,7 +2962,8 @@ while True:
         bot.infinity_polling(timeout=20, long_polling_timeout=20)
     except Exception as e:
         print(f"[POLLING ERROR] {type(e).__name__}: {e}")
+        err_logger.exception("Polling error: %s: %s", type(e).__name__, e)
         traceback.print_exc()
-        print("[POLLING] تلاش مجدد در 5 ثانیه...")
-        import time
+        print("[POLLING] Retrying in 5 seconds...")
+        logger.info("Retrying polling in 5 seconds...")
         time.sleep(5)

@@ -222,6 +222,7 @@ def create_table_transactions(database_name):
                          ) NOT NULL,
         amount           DECIMAL(12, 0) NOT NULL,
         description      TEXT,
+        user_note        VARCHAR(500)   DEFAULT NULL,
         status           ENUM('pending', 'approved', 'rejected') DEFAULT NULL,
         receipt_file_id  VARCHAR(255)   DEFAULT NULL,
         installment_id   INT            DEFAULT NULL,
@@ -307,4 +308,3 @@ if __name__ == "__main__":
     create_table_installments(DB_NAME)          # ← قبل از transactions (FK)
     create_table_transactions(DB_NAME)          # ← بعد از installments (FK به installment_id)
     ensure_superadmin(DB_NAME)
-
