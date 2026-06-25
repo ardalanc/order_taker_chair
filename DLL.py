@@ -250,10 +250,11 @@ def create_table_installments(database_name):
         total_amount      DECIMAL(12, 0) NOT NULL,
         paid_amount       DECIMAL(12, 0) DEFAULT 0,
         num_installments  INT            NOT NULL,
-        per_installment   DECIMAL(12, 0) NOT NULL,
         due_dates         JSON,
         created_at        DATETIME DEFAULT NOW(),
         created_by        INT,
+        per_installment DECIMAL(12, 0) NOT NULL,
+        first_installment DECIMAL(12, 0) NOT NULL,
         FOREIGN KEY (user_id)    REFERENCES users  (id),
         FOREIGN KEY (created_by) REFERENCES admins (id)
     );

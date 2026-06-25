@@ -500,7 +500,7 @@ def db_get_orders_paged(status_filter: str, offset: int, user_db_id: int = None,
     elif status_filter == "all":
         where = "1=1"
     elif status_filter in STATUS_FA:
-        where = f"o.status='{status_filter}'"
+        where = "o.status=%s"
     else:
         where = "1=1"
 
@@ -508,19 +508,21 @@ def db_get_orders_paged(status_filter: str, offset: int, user_db_id: int = None,
 
     price_col = "o.total_price," if show_price else ""
 
-    cur.execute(f"""
-        SELECT COUNT(*) AS cnt FROM orders o WHERE {where} {user_clause}
-    """)
+    status_param = (status_filter,) if status_filter in STATUS_FA else ()
+
+    cur.execute(f"SELECT COUNT(*) AS cnt FROM orders o WHERE {where} {user_clause}",
+                status_param)
+    
     total = cur.fetchone()["cnt"]
 
     cur.execute(f"""
         SELECT o.id, {price_col} o.fabric, o.delivery_date,
-               o.status, o.created_at, u.name AS user_name, o.user_id
+            o.status, o.created_at, u.name AS user_name, o.user_id
         FROM orders o JOIN users u ON u.id=o.user_id
         WHERE {where} {user_clause}
         ORDER BY o.created_at DESC
         LIMIT %s OFFSET %s
-    """, (PAGE_SIZE, offset))
+    """, status_param + (PAGE_SIZE, offset))
     rows = cur.fetchall(); cur.close(); conn.close()
     return rows, total
 
@@ -871,10 +873,11 @@ def db_add_installment(user_db_id: int, total: int, count: int,
         return None, available
 
     per = total // count
+    first = per + (total - per * count)
     cur.execute("""
-        INSERT INTO installments (user_id,total_amount,num_installments,per_installment,due_dates,created_by)
-        VALUES(%s,%s,%s,%s,%s,%s)
-    """, (user_db_id, total, count, per, json.dumps(due_dates), admin_db_id))
+        INSERT INTO installments (user_id,total_amount,num_installments,per_installment,first_installment,due_dates,created_by)
+        VALUES(%s,%s,%s,%s,%s,%s,%s)
+    """, (user_db_id, total, count, per, first, json.dumps(due_dates), admin_db_id))
     iid = cur.lastrowid; conn.commit(); cur.close(); conn.close()
     return iid, None
 
